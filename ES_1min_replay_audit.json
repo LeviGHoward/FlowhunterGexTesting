@@ -1,0 +1,411 @@
+[
+  {
+    "file": "20261012.parquet",
+    "minutes": 390,
+    "last_trade_events": 488909,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 2794556,
+      "1": 2826290,
+      "2": 694159,
+      "5": 694159,
+      "3": 30,
+      "4": 139,
+      "8": 2,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261013.parquet",
+    "minutes": 390,
+    "last_trade_events": 636816,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "2": 848135,
+      "5": 848135,
+      "0": 2963029,
+      "1": 2992949,
+      "3": 74,
+      "4": 37,
+      "8": 2,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261014.parquet",
+    "minutes": 390,
+    "last_trade_events": 1203828,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "1": 5255244,
+      "0": 5081221,
+      "2": 1536449,
+      "5": 1536449,
+      "3": 34,
+      "4": 585,
+      "8": 2,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261015.parquet",
+    "minutes": 390,
+    "last_trade_events": 1078960,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "1": 5137026,
+      "0": 5170579,
+      "2": 1395778,
+      "5": 1395778,
+      "4": 103,
+      "8": 2,
+      "3": 207,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261016.parquet",
+    "minutes": 390,
+    "last_trade_events": 1488044,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "1": 5248172,
+      "2": 1696871,
+      "5": 1696871,
+      "0": 5225075,
+      "3": 6,
+      "8": 1,
+      "4": 395
+    }
+  },
+  {
+    "file": "20261018.parquet",
+    "minutes": 0,
+    "last_trade_events": 0,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "6": 1,
+      "8": 1,
+      "0": 307305,
+      "1": 304489,
+      "7": 1,
+      "2": 84261,
+      "5": 84261,
+      "3": 353,
+      "4": 11
+    }
+  },
+  {
+    "file": "20261019.parquet",
+    "minutes": 390,
+    "last_trade_events": 1043073,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 4410962,
+      "1": 4345703,
+      "2": 1306728,
+      "5": 1306728,
+      "8": 2,
+      "3": 68,
+      "6": 1,
+      "7": 1,
+      "4": 66
+    }
+  },
+  {
+    "file": "20261020.parquet",
+    "minutes": 390,
+    "last_trade_events": 1007083,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 4891420,
+      "1": 4849521,
+      "2": 1330424,
+      "5": 1330424,
+      "4": 143,
+      "8": 2,
+      "3": 186,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261021.parquet",
+    "minutes": 390,
+    "last_trade_events": 998501,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "1": 4508241,
+      "0": 4446434,
+      "2": 1284773,
+      "5": 1284773,
+      "4": 262,
+      "8": 2,
+      "3": 85,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261022.parquet",
+    "minutes": 390,
+    "last_trade_events": 1329891,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 6211439,
+      "1": 6201106,
+      "2": 1703547,
+      "5": 1703547,
+      "4": 375,
+      "8": 2,
+      "6": 1,
+      "7": 1,
+      "3": 33
+    }
+  },
+  {
+    "file": "20261023.parquet",
+    "minutes": 390,
+    "last_trade_events": 1034691,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "2": 1284643,
+      "5": 1284644,
+      "1": 5136634,
+      "0": 5186251,
+      "4": 147,
+      "8": 2,
+      "3": 1,
+      "7": 1,
+      "6": 1
+    }
+  },
+  {
+    "file": "20261025.parquet",
+    "minutes": 0,
+    "last_trade_events": 0,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "3": 35,
+      "4": 154,
+      "7": 2,
+      "6": 2,
+      "5": 77569,
+      "8": 2,
+      "2": 77568,
+      "0": 557671,
+      "1": 552457
+    }
+  },
+  {
+    "file": "20261026.parquet",
+    "minutes": 390,
+    "last_trade_events": 996760,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "1": 4418442,
+      "0": 4456076,
+      "2": 1266759,
+      "5": 1266759,
+      "3": 228,
+      "8": 2,
+      "6": 1,
+      "7": 1,
+      "4": 49
+    }
+  },
+  {
+    "file": "20261027.parquet",
+    "minutes": 390,
+    "last_trade_events": 840882,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 3732171,
+      "1": 3739996,
+      "2": 1126950,
+      "5": 1126950,
+      "4": 51,
+      "3": 187,
+      "8": 2,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261028.parquet",
+    "minutes": 390,
+    "last_trade_events": 968459,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 4819010,
+      "1": 4876774,
+      "2": 1274484,
+      "5": 1274484,
+      "3": 218,
+      "4": 110,
+      "8": 2,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261029.parquet",
+    "minutes": 390,
+    "last_trade_events": 1119874,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 6084597,
+      "1": 6222639,
+      "2": 1523843,
+      "5": 1523843,
+      "3": 35,
+      "4": 298,
+      "8": 2,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261030.parquet",
+    "minutes": 390,
+    "last_trade_events": 1432751,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 6149759,
+      "1": 6592990,
+      "2": 1699777,
+      "5": 1699777,
+      "4": 428,
+      "8": 1
+    }
+  },
+  {
+    "file": "20261101.parquet",
+    "minutes": 1,
+    "last_trade_events": 1,
+    "missing_morning_minutes": 150,
+    "invalid_last_events": 0,
+    "event_types": {
+      "3": 99,
+      "4": 5,
+      "7": 2,
+      "6": 2,
+      "5": 66908,
+      "8": 2,
+      "2": 66907,
+      "1": 343101,
+      "0": 355940
+    }
+  },
+  {
+    "file": "20261102.parquet",
+    "minutes": 390,
+    "last_trade_events": 1191547,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "2": 1518775,
+      "5": 1518775,
+      "1": 5901547,
+      "0": 5720876,
+      "3": 196,
+      "8": 2,
+      "4": 304,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261103.parquet",
+    "minutes": 390,
+    "last_trade_events": 854540,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 6258932,
+      "1": 6289031,
+      "2": 1412012,
+      "5": 1412012,
+      "4": 545,
+      "3": 219,
+      "8": 2,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261104.parquet",
+    "minutes": 390,
+    "last_trade_events": 1300343,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "1": 8362300,
+      "0": 8209756,
+      "2": 1768192,
+      "5": 1768192,
+      "3": 452,
+      "8": 2,
+      "6": 1,
+      "7": 1,
+      "4": 165
+    }
+  },
+  {
+    "file": "20261105.parquet",
+    "minutes": 390,
+    "last_trade_events": 2318514,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "1": 13805015,
+      "0": 13368018,
+      "2": 2746567,
+      "5": 2746567,
+      "4": 1546,
+      "3": 230,
+      "8": 2,
+      "6": 1,
+      "7": 1
+    }
+  },
+  {
+    "file": "20261106.parquet",
+    "minutes": 376,
+    "last_trade_events": 979006,
+    "missing_morning_minutes": 0,
+    "invalid_last_events": 0,
+    "event_types": {
+      "0": 6981123,
+      "1": 7113793,
+      "2": 1246151,
+      "5": 1246152,
+      "3": 209,
+      "4": 1,
+      "7": 1,
+      "6": 1,
+      "8": 2
+    }
+  }
+]

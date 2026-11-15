@@ -1,0 +1,13 @@
+jsonschema>=4
+numpy>=1.24
+pyarrow>=14
+tzdata
+
+[dev]
+pytest>=7
+
+[parquet]
+pyarrow>=14
+
+[report]
+matplotlib>=3

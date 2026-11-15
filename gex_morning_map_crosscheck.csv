@@ -1,0 +1,7 @@
+date,symbol,archive_put_wall,archive_call_wall,archive_regime,archive_url,archive_capture,comparison_status
+2026-08-20,ES,7638.5,7789.25,negative_gamma,https://gex-levels.com/morning-map/2026-08-20,session_open_claimed,six_record_manually_verified_seed_not_full_archive
+2026-08-20,NQ,29429.5,29677.0,negative_gamma,https://gex-levels.com/morning-map/2026-08-20,session_open_claimed,six_record_manually_verified_seed_not_full_archive
+2026-09-15,ES,7683.0,7723.5,negative_gamma,https://gex-levels.com/morning-map/2026-09-15,session_open_claimed,six_record_manually_verified_seed_not_full_archive
+2026-09-15,NQ,29265.5,29473.0,negative_gamma,https://gex-levels.com/morning-map/2026-09-15,session_open_claimed,six_record_manually_verified_seed_not_full_archive
+2026-10-08,ES,7828.75,7859.0,positive_gamma,https://gex-levels.com/morning-map/2026-10-08,session_open_claimed,six_record_manually_verified_seed_not_full_archive
+2026-10-08,NQ,31276.75,31484.0,negative_gamma,https://gex-levels.com/morning-map/2026-10-08,session_open_claimed,six_record_manually_verified_seed_not_full_archive

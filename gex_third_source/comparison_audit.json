@@ -1,0 +1,17 @@
+{
+  "algoindex_total_rows": 1652,
+  "algoindex_ES_premarket_wall_pairs": 72,
+  "unique_dates": 36,
+  "github_overlap_rows": 72,
+  "morning_map_overlap_rows": 0,
+  "morning_map_unique_overlap_dates": 0,
+  "morning_map_source": "embedded_six_record_seed",
+  "morning_map_seed_record_count": 6,
+  "caveats": [
+    "AlgoIndex 0DTE and 45-day models must remain separate",
+    "Previous-day GitHub records are unverified for the following session",
+    "Different wall calculations do not imply incorrect values",
+    "AlgoIndex post-session held/broke labels do not measure 9:30\u201312:00 wall-to-wall completion",
+    "This comparison does not validate options-chain reconstruction or price-basis conversion"
+  ]
+}

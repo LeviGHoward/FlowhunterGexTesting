@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: nt8bridge
+Version: 1.7.5
+License: MIT
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: jsonschema>=4
+Requires-Dist: numpy>=1.24
+Requires-Dist: pyarrow>=14
+Requires-Dist: tzdata
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Provides-Extra: report
+Requires-Dist: matplotlib>=3; extra == "report"
+Provides-Extra: parquet
+Requires-Dist: pyarrow>=14; extra == "parquet"
+Dynamic: license-file

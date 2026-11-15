@@ -1,0 +1,132 @@
+import csv
+import json
+from pathlib import Path
+from datetime import time, datetime, timedelta
+from zoneinfo import ZoneInfo
+from collections import Counter
+import pyarrow.parquet as pq
+import sys
+
+root = Path(sys.argv[1])
+output = Path(sys.argv[2])
+start_date = "2026-10-12"
+end_date = "2026-11-12"
+et = ZoneInfo("America/New_York")
+
+fields = [
+    "datetime", "open", "high", "low", "close",
+    "volume", "trades", "source", "trading_date", "session"
+]
+
+audit = []
+files = sorted(
+    p for p in root.glob("*.parquet")
+    if start_date.replace("-", "") <= p.stem <= end_date.replace("-", "")
+)
+
+if not files:
+    raise SystemExit("No matching Parquet files found.")
+
+with output.open("w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(fields)
+
+    for path in files:
+        pf = pq.ParquetFile(path)
+        bars = {}
+        counts = Counter()
+        invalid = 0
+
+        for batch in pf.iter_batches(
+            batch_size=100000,
+            columns=["Timestamp", "MarketDataType", "Price", "Volume"]
+        ):
+            timestamps = batch.column(0).to_pylist()
+            types = batch.column(1).to_pylist()
+            prices = batch.column(2).to_pylist()
+            volumes = batch.column(3).to_pylist()
+
+            for ts, typ, price, vol in zip(
+                timestamps, types, prices, volumes
+            ):
+                counts[int(typ)] += 1
+
+                # NinjaTrader MarketDataType.Last = 2
+                if typ != 2:
+                    continue
+
+                if (
+                    ts is None or price is None or
+                    price <= 0 or vol is None or vol < 0 or
+                    abs(price * 4 - round(price * 4)) > 0.00001
+                ):
+                    invalid += 1
+                    continue
+
+                local = ts.astimezone(et)
+                date = local.date().isoformat()
+
+                if not (start_date <= date <= end_date):
+                    continue
+
+                if not (time(9, 30) <= local.time() < time(16, 0)):
+                    continue
+
+                minute = local.replace(second=0, microsecond=0)
+
+                if minute not in bars:
+                    bars[minute] = [
+                        price, price, price, price, 0, 0
+                    ]
+
+                bar = bars[minute]
+                bar[1] = max(bar[1], price)
+                bar[2] = min(bar[2], price)
+                bar[3] = price
+                bar[4] += vol
+                bar[5] += 1
+
+        for minute, bar in sorted(bars.items()):
+            writer.writerow([
+                minute.isoformat(),
+                *bar,
+                "NT8Replay_L1",
+                minute.date().isoformat(),
+                "RTH"
+            ])
+
+        dates = sorted(set(k.date() for k in bars))
+        missing = 0
+
+        for day in dates:
+            morning = datetime.combine(day, time(9, 30), et)
+            missing += sum(
+                morning + timedelta(minutes=i) not in bars
+                for i in range(150)
+            )
+
+        audit.append({
+            "file": path.name,
+            "minutes": len(bars),
+            "last_trade_events": sum(
+                b[5] for b in bars.values()
+            ),
+            "missing_morning_minutes": missing,
+            "invalid_last_events": invalid,
+            "event_types": dict(counts)
+        })
+
+        print(
+            f"{path.name}: {len(bars)} minutes, "
+            f"{audit[-1]['last_trade_events']} trades",
+            flush=True
+        )
+
+audit_path = output.with_name(output.stem + "_audit.json")
+audit_path.write_text(json.dumps(audit, indent=2))
+
+print("\nCOMPLETE")
+print("CSV:", output)
+print("Audit:", audit_path)
+print("Files processed:", len(audit))
+print("Total minutes:", sum(x["minutes"] for x in audit))

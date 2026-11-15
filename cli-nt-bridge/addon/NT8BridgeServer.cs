@@ -1,0 +1,4766 @@
+﻿// NT8BridgeServer.cs — NT8 Bridge AddOn (Part 2 v1: in-process compile handler)
+//
+// Watches  <UserDataDir>\NT8Bridge\trigger\  for {kind:"compile"} request files,
+// calls NinjaTrader.Code.Compiler.Compile(...) via reflection, and writes the
+// structured Roslyn error diagnostics to  result\compile_<id>.json.
+//
+// One-time install: copy into  Documents\NinjaTrader 8\bin\Custom\AddOns\,
+// then compile in the NinjaScript editor (F5). On load it writes a heartbeat
+// so the Python side can tell "AddOn not running" from "compile failed".
+//
+// Backtest (Strategy Analyzer) handling is Part 3 — not in this file.
+// Anti-lockup: every override try/catch-wrapped, timer disposed on Terminated,
+// wall-clock polling (no per-tick work), re-entrancy guarded.
+#region Using declarations
+using System;
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;   // windows: Win32 window inventory (NT is multi-UI-threaded)
+using System.Text;
+using System.Threading;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Interop;           // windows: WindowInteropHelper -> HWND
+using NinjaTrader.Cbi;
+using NinjaTrader.Core;
+using NinjaTrader.Data;
+using NinjaTrader.Gui.NinjaScript.StrategyAnalyzer;
+using NinjaTrader.NinjaScript;
+#endregion
+
+namespace NinjaTrader.NinjaScript.AddOns
+{
+    public partial class NT8BridgeServer : AddOnBase
+    {
+        private readonly object _gate = new object();
+        private Timer _poller;
+        private string _triggerDir;
+        private string _resultDir;
+        private volatile bool _beatInFlight;
+        // connection name -> last drop classification ("inadvertent"|"user"|"connected"),
+        // written by the ConnectionStatusUpdate event (fires on arbitrary threads) so it
+        // MUST be a ConcurrentDictionary; read by the poller thread (connections handler).
+        private readonly ConcurrentDictionary<string, string> _dropClass = new ConcurrentDictionary<string, string>();
+
+        // ===== Output tee: NT8's Output 1 / Output 2 (Print) -> per-tab JSONL =====
+        // OPT-IN via the marker file <NT8>/NT8Bridge/output/tee.on, which the CLI writes
+        // directly — so turning the tee on takes effect within one poll tick and needs NO
+        // NT8 reload (a reload here costs a strategy restart every time).
+        //
+        // Print() runs on strategy CALCULATION threads, on every tick, for the chattiest
+        // strategies on this box. So OnNtOutput does NO I/O: it stamps, enqueues, returns.
+        // A synchronous file append there would put disk latency and lock contention on the
+        // tick path — the same shape as the ATM stale-ID flood that saturated the logger
+        // mutex and ended in a WER crash. The drain runs on the poller instead, OUTSIDE the
+        // compile gate, so a long compile can't stall it into overflow.
+        private sealed class TeeRec { public string T; public int Tab; public string Msg; public bool Reset; }
+        private string _outDir;
+        private string _teeMarker;
+        private volatile bool _teeOn;
+        private readonly ConcurrentQueue<TeeRec> _teeQueue = new ConcurrentQueue<TeeRec>();
+        private int _teeQueued;                              // Interlocked: ConcurrentQueue has no cheap Count
+        private const int TeeQueueMax = 20000;               // past this: drop + count, so memory stays bounded
+        private int _teeDropped1, _teeDropped2;              // per-tab drop counters (Interlocked)
+        private const long TeeRotateBytes = 10L * 1024 * 1024;   // rotate at 10 MB, keep one generation
+        private int _teeDraining;                            // re-entrancy guard (the drain is single-threaded)
+        private bool _teeSubscribed;
+
+        protected override void OnStateChange()
+        {
+            try
+            {
+                if (State == State.SetDefaults)
+                {
+                    Name = "NT8BridgeServer";
+                }
+                else if (State == State.Configure)
+                {
+                    Init();
+                }
+                else if (State == State.Terminated)
+                {
+                    try { Connection.ConnectionStatusUpdate -= OnConnStatus; } catch { }
+                    if (_teeSubscribed)
+                    {
+                        try { NinjaTrader.Code.Output.OutputEvent -= OnNtOutput; } catch { }
+                        _teeSubscribed = false;
+                    }
+                    _teeOn = false;
+                    // Flush what's queued so a reload loses nothing — through the SAME guard the
+                    // poller uses, since Terminated runs on a different thread and two threads in
+                    // DrainTee would interleave appends to one file.
+                    try { FlushTeeGuarded(); } catch { }
+                    try { if (_poller != null) _poller.Dispose(); } catch { }
+                    _poller = null;
+                }
+            }
+            catch (Exception ex) { LogSafe("OnStateChange: " + ex.Message); }
+        }
+
+        private void Init()
+        {
+            string root = Path.Combine(Globals.UserDataDir, "NT8Bridge");
+            _triggerDir = Path.Combine(root, "trigger");
+            _resultDir = Path.Combine(root, "result");
+            Directory.CreateDirectory(_triggerDir);
+            Directory.CreateDirectory(_resultDir);
+            // Diagnostic heartbeat: proves the AddOn loaded and the poller started.
+            WriteResult("heartbeat.json",
+                "{\"server\":\"NT8BridgeServer\",\"started\":" + JsonStr(Globals.Now.ToString("o")) + "}");
+            // Output tee: the marker decides whether it records; subscribing is harmless when
+            // it's off (the handler returns on a single volatile bool read).
+            _outDir = Path.Combine(root, "output");
+            _teeMarker = Path.Combine(_outDir, "tee.on");
+            _teeOn = File.Exists(_teeMarker);
+            try { NinjaTrader.Code.Output.OutputEvent += OnNtOutput; _teeSubscribed = true; }
+            catch (Exception ex) { LogSafe("tee subscribe: " + ex.Message); }
+            LogSafe("tee: Output 1/2 capture " + (_teeOn ? "ON" : "off (drop " + _teeMarker + " to enable)"));
+            // Poll once per second on wall-clock time; never tick-time.
+            _poller = new Timer(delegate { Poll(); }, null, 1000, 1000);
+            // Classify every connection status change at the moment it happens (named
+            // handler so Terminated can unsubscribe it — no leak across reload cycles).
+            // ConnectionLost / error-disconnect = inadvertent (auto-reconnect eligible);
+            // clean Disconnected / UserAbort = the user parked it (never auto-reconnect).
+            try { Connection.ConnectionStatusUpdate += OnConnStatus; } catch (Exception ex) { LogSafe("conn subscribe: " + ex.Message); }
+        }
+
+        private void Poll()
+        {
+            TryBeat();   // UI-liveness heartbeat (runs regardless of the compile gate)
+            TeeTick();   // Output 1/2 drain — OUTSIDE the gate, so a long compile can't stall it
+            // Re-entrancy guard: skip this tick if the previous compile is still running.
+            if (!Monitor.TryEnter(_gate)) return;
+            try
+            {
+                if (_triggerDir == null) return;
+                CheckLease();
+                SubscribePlaybackEvents();
+                // Subscribe from the poller, not from the first `botout` request:
+                // a line printed BEFORE the driver first asks would otherwise be
+                // lost, and a missing line is indistinguishable from a silent bot.
+                SubscribeBotOutput();
+                PruneResults();
+                foreach (string file in Directory.GetFiles(_triggerDir, "*.json"))
+                    HandleTrigger(file);
+            }
+            catch (Exception ex) { LogSafe("Poll: " + ex.Message); }
+            finally { Monitor.Exit(_gate); }
+        }
+
+        // UI-thread liveness beat: rewrite heartbeat.json from the MAIN UI dispatcher
+        // each tick (single in-flight, per the dispatcher-throttle rule). If the UI
+        // thread hangs, the file stops updating and `nt8bridge watchdog` detects the
+        // stale mtime and restarts NT8. A timer-thread write would falsely stay fresh.
+        private void TryBeat()
+        {
+            try
+            {
+                if (_beatInFlight) return;
+                var disp = Globals.MainThreadDispatcher;
+                if (disp == null) return;
+                _beatInFlight = true;
+                disp.BeginInvoke(new Action(delegate
+                {
+                    try
+                    {
+                        WriteResult("heartbeat.json",
+                            "{\"server\":\"NT8BridgeServer\",\"beat\":" + JsonStr(DateTime.UtcNow.ToString("o")) + "}");
+                    }
+                    catch { }
+                    finally { _beatInFlight = false; }
+                }));
+            }
+            catch (Exception ex) { _beatInFlight = false; LogSafe("TryBeat: " + ex.Message); }
+        }
+
+        private void HandleTrigger(string file)
+        {
+            string id = null;
+            string kind = null;
+            bool leaseHolder = false;   // did THIS request carry `leaseSec`? - see RearmLease
+            try
+            {
+                string text = File.ReadAllText(file);
+                DateTime writtenUtc;
+                try { writtenUtc = File.GetLastWriteTimeUtc(file); }
+                catch { writtenUtc = DateTime.UtcNow; }
+                try { File.Delete(file); } catch { }   // consume the trigger
+                id = ExtractJsonString(text, "id");
+                kind = ExtractJsonString(text, "kind");
+                leaseHolder = NoteLease(text);   // a leaseSec request: the driver is alive - push the deadline out
+
+                // A caller that has timed out is gone; running its command now acts on
+                // a state it never saw. Measured 2026-08-19: a backlog released after
+                // 11 minutes enabled, disabled and removed a strategy in the middle of
+                // a running measurement (see the file header).
+                double ageSec = (DateTime.UtcNow - writtenUtc).TotalSeconds;
+                double ttlSec = RequestTtlSec(text);
+                if (ageSec > ttlSec)
+                {
+                    LogSafe("expired " + kind + " " + id + ": " + ageSec.ToString("0") +
+                            "s old, ttl " + ttlSec.ToString("0") + "s - NOT executed");
+                    WriteResult(ResultPrefixEx(kind, ResultPrefix(kind)) + id + ".json",
+                        "{\"id\":" + JsonStr(id) + ",\"status\":\"expired\",\"executed\":false" +
+                        ",\"ageSec\":" + ageSec.ToString("0.###", InvCi) +
+                        ",\"ttlSec\":" + ttlSec.ToString("0.###", InvCi) +
+                        ",\"errors\":[{\"code\":\"EXPIRED\",\"message\":" +
+                        JsonStr("request waited " + ageSec.ToString("0") + "s in the queue, past its " +
+                                ttlSec.ToString("0") + "s TTL; not executed") + "}]}");
+                    return;
+                }
+                if (kind == "compile")
+                    WriteResult("compile_" + id + ".json", RunCompile(id));
+                else if (kind == "reload")
+                    WriteResult("reload_" + id + ".json", RunCompileCore(id, true));
+                else if (kind == "windows")
+                    WriteResult("windows_" + id + ".json", RunWindows(id));
+                else if (kind == "backtest")
+                    RunBacktest(id, ParseParams(text));
+                else if (kind == "account")
+                    WriteResult("account_" + id + ".json", RunAccountState(id, ExtractJsonString(text, "account")));
+                else if (kind == "flatten")
+                    WriteResult("flatten_" + id + ".json", RunFlatten(id, ExtractJsonString(text, "account"), ExtractJsonString(text, "instrument")));
+                else if (kind == "connections")
+                    WriteResult("connections_" + id + ".json", RunConnections(id));
+                else if (kind == "reconnect")
+                    WriteResult("reconnect_" + id + ".json", RunReconnect(id, ExtractJsonString(text, "connection")));
+                else if (kind == "playback")
+                    WriteResult("playback_" + id + ".json", RunPlayback(id, ExtractJsonString(text, "instrument"), ExtractJsonString(text, "coverage")));
+                else if (kind == "playbackrun")
+                    WriteResult("playbackrun_" + id + ".json", RunPlaybackRun(id, text));
+                else if (kind == "ntstatus")
+                    WriteResult("ntstatus_" + id + ".json", RunNtStatus(id));
+                else if (kind == "workspace")
+                    WriteResult("workspace_" + id + ".json", RunWorkspace(id));
+                else if (kind == "strategies")
+                    WriteResult("strategies_" + id + ".json", RunStrategies(id, text));
+                else if (kind == "ghostorders")
+                    WriteResult("ghostorders_" + id + ".json", RunGhostOrders(id, text));
+                else if (kind == "screenshot")
+                    WriteResult("screenshot_" + id + ".json", RunScreenshot(id, text));
+                else if (kind == "peek")
+                    WriteResult("peek_" + id + ".json", RunPeek(id));
+                else if (kind == "probe")
+                    WriteResult("probe_" + id + ".json", RunProbe(id));
+                else if (kind == "configure")
+                    WriteResult("configure_" + id + ".json", RunConfigure(id, text));
+                else if (kind == "satemplate")
+                    WriteResult("satemplate_" + id + ".json", RunSaTemplate(id, text));
+                else if (kind == "analyzerrun")
+                    RunAnalyzerRun(id, text);   // async: the poll writes the result
+                else if (kind == "feedhealth")
+                    WriteResult("feedhealth_" + id + ".json", RunFeedHealth(id, ExtractJsonString(text, "instruments")));
+                else if (kind == "performance")
+                    WriteResult("perf_" + id + ".json", RunPerformance(id,
+                        ExtractJsonString(text, "account"), ExtractJsonString(text, "from"),
+                        ExtractJsonString(text, "to"), ExtractJsonString(text, "instrument")));
+                else if (kind == "perfwindow")
+                    WriteResult("perfwindow_" + id + ".json", RunPerfWindow(id, ExtractJsonString(text, "account"),
+                        ExtractJsonString(text, "generate") == "true",
+                        ExtractJsonString(text, "from"), ExtractJsonString(text, "to")));
+                else if (kind == "chartseries")
+                    WriteResult("chartseries_" + id + ".json", RunChartSeries(id, text));
+                else if (kind == "marketReplayDump")
+                    WriteResult("marketReplayDump_" + id + ".json", RunMarketReplayDump(id, text));
+                else if (kind == "marketReplayDownload")
+                    WriteResult("marketReplayDownload_" + id + ".json", RunMarketReplayDownload(id, text));
+            }
+            catch (Exception ex)
+            {
+                LogSafe("HandleTrigger: " + ex.Message);
+                if (id != null)
+                    // route the fallback error to the file the caller polls (compile_/backtest_/account_).
+                    WriteResult(ResultPrefixEx(kind, ResultPrefix(kind)) + id + ".json",
+                        "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{\"file\":\"\",\"line\":0," +
+                        "\"code\":\"BRIDGE\",\"message\":" + JsonStr(ex.Message) + "}],\"assemblyReloaded\":false}");
+            }
+            finally
+            {
+                // The answer has just been written: the driver is alive and will read it.
+                // Its lease runs from HERE, not from the receipt - see RearmLease. Only
+                // for the lease holder's own requests: another client's answer is no
+                // proof that the driver lives.
+                if (leaseHolder) RearmLease();
+            }
+        }
+
+        // result-file prefix per request kind, so a dispatch-level failure lands in the
+        // file the caller is polling rather than always compile_.
+        private static string ResultPrefix(string kind)
+        {
+            if (kind == "account") return "account_";
+            if (kind == "flatten") return "flatten_";
+            if (kind == "backtest") return "backtest_";
+            if (kind == "connections") return "connections_";
+            if (kind == "reconnect") return "reconnect_";
+            if (kind == "playback") return "playback_";
+            if (kind == "ntstatus") return "ntstatus_";
+            if (kind == "workspace") return "workspace_";
+            if (kind == "strategies") return "strategies_";
+            if (kind == "ghostorders") return "ghostorders_";
+            if (kind == "screenshot") return "screenshot_";
+            if (kind == "peek") return "peek_";
+            if (kind == "probe") return "probe_";
+            if (kind == "configure") return "configure_";
+            if (kind == "feedhealth") return "feedhealth_";
+            if (kind == "performance") return "perf_";
+            if (kind == "perfwindow") return "perfwindow_";
+            if (kind == "chartseries") return "chartseries_";
+            if (kind == "reload") return "reload_";
+            if (kind == "windows") return "windows_";
+            if (kind == "marketReplayDump") return "marketReplayDump_";
+            if (kind == "marketReplayDownload") return "marketReplayDownload_";
+            return "compile_";
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════════════════════════
+        //  READ-ONLY STATE COMMANDS  (playback · ntstatus · workspace)
+        //
+        //  WHY THESE EXIST — 2026-08-02, and each one is tied to a failure that actually cost a day.
+        //    A Gate 3 equivalence run compared two boxes proven byte-identical in every input we had made
+        //    hashable: code (muster), replay .nrd, historical bars, and the chart+strategy blob. It still
+        //    diverged. The cause was in none of them — it was the transport state inside a running NT:
+        //    one box's replay clock was parked at the range start, the other's was 27 h in and moving, so
+        //    the same Reset() call seeked on one and no-opped on the other.
+        //
+        //    ⭐ THE PATTERN: every input we could verify was a FILE. Everything still diverging lives only
+        //    in a running NinjaTrader — no file, no hash, no read-back — and so was set by hand, per box,
+        //    at different moments. We were verifying what was easy to verify. These three commands give
+        //    that state a read-back, which is the whole prerequisite for ever trusting it.
+        //
+        //    ⭐ THE SCALING ARGUMENT: the Watch is SIX replay workers. Any input that needs a GUI click per
+        //    box cannot be held equal across a matrix, and any check that needs an eye on a screen cannot
+        //    be run across one either. Read-only first — these three answer questions, they change nothing.
+        //
+        //  Each maps to a specific incident:
+        //    playback   — the divergence above, and the Playback range silently reverting across restarts
+        //    ntstatus   — a STALE DLL ran an entire 33-minute cell while the source on disk said otherwise
+        //    workspace  — two runs where the strategy was silently disabled (toggling Playback disables it)
+        // ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+        private const BindingFlags BFStatic = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+        // Long enough that a real replay clock provably moves (400 ms at 100x is 40 replay-seconds), short
+        // enough that a status call stays snappy. Same constant, same reasoning, as the Conductor pre-flight.
+        private const int PlaybackSampleMs = 400;
+        private static string NtCoreVersion()
+        {
+            try { return typeof(Connection).Assembly.GetName().Version.ToString(); } catch { return ""; }
+        }
+
+        // ── playback ────────────────────────────────────────────────────────────────────────────────────
+        //  Connection state + the replay clock + speed + what the .nrd files on disk actually cover.
+        //
+        //  ⚠ Reflection, not a direct reference — the same reasoning as SentinelConductor: PlaybackAdapter's
+        //  members are internal-ish, and NinjaTrader compiles every .cs under bin\Custom into ONE assembly,
+        //  so a hard binding would turn any NT API change into a whole-suite compile break. Reflection
+        //  degrades to nulls in the JSON instead.
+        //
+        //  ⭐ `movingSec` is the field this was written for. A single clock reading cannot distinguish a
+        //  parked transport from a running one, and that distinction is exactly what broke Gate 3. Two
+        //  samples a real gap apart can. REPORT THE OUTCOME, NOT THE INTENT.
+        private string RunPlayback(string id, string instrument, string coverageFlag)
+        {
+            var sb = new StringBuilder();
+            try
+            {
+                Type pb = typeof(Connection).Assembly.GetType("NinjaTrader.Adapter.PlaybackAdapter", false);
+                PropertyInfo piSpeed = pb != null ? pb.GetProperty("PlaybackSpeed", BFStatic) : null;
+                PropertyInfo piNowEst = pb != null ? pb.GetProperty("NowEst", BFStatic) : null;
+                FieldInfo fiMaxSpeed = pb != null ? pb.GetField("MaxSpeedValue", BFStatic) : null;
+                MethodInfo miMinMax = pb != null
+                    ? pb.GetMethod("GetReplayMinMaxDates", BFStatic, null,
+                        new[] { typeof(string), typeof(DateTime).MakeByRefType(), typeof(DateTime).MakeByRefType() }, null)
+                    : null;
+                PropertyInfo piConn = typeof(Connection).GetProperty("PlaybackConnection", BFStatic);
+
+                object speed = null, maxSpeed = null;
+                try { if (piSpeed != null) speed = piSpeed.GetValue(null); } catch (Exception ex) { LogSafe("playback speed: " + ex.Message); }
+                try { if (fiMaxSpeed != null) maxSpeed = fiMaxSpeed.GetValue(null); } catch (Exception ex) { LogSafe("playback maxspeed: " + ex.Message); }
+
+                // Two clock samples, a real gap apart — parked vs running (see above).
+                DateTime? c1 = ReadClock(piNowEst);
+                Thread.Sleep(PlaybackSampleMs);
+                DateTime? c2 = ReadClock(piNowEst);
+                double movingSec = (c1.HasValue && c2.HasValue) ? (c2.Value - c1.Value).TotalSeconds : 0.0;
+
+                string connStatus = "none";
+                bool connected = false;
+                try
+                {
+                    var c = piConn != null ? piConn.GetValue(null) as Connection : null;
+                    if (c != null) { connStatus = c.Status.ToString(); connected = c.Status == ConnectionStatus.Connected; }
+                }
+                catch (Exception ex) { LogSafe("playback conn: " + ex.Message); }
+
+                sb.Append("{\"id\":").Append(JsonStr(id))
+                  .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"transportResolved\":").Append(pb != null ? "true" : "false")
+                  .Append(",\"connection\":{\"status\":").Append(JsonStr(connStatus))
+                  .Append(",\"connected\":").Append(connected ? "true" : "false").Append("}")
+                  .Append(",\"clockEst\":").Append(c2.HasValue ? JsonStr(c2.Value.ToString("o")) : "null")
+                  .Append(",\"clockEstFirst\":").Append(c1.HasValue ? JsonStr(c1.Value.ToString("o")) : "null")
+                  .Append(",\"sampleMs\":").Append(PlaybackSampleMs.ToString(InvCi))
+                  .Append(",\"movingSec\":").Append(movingSec.ToString("0.###", InvCi))
+                  .Append(",\"moving\":").Append(movingSec > 2.0 ? "true" : "false")
+                  .Append(",\"speed\":").Append(speed is int ? ((int)speed).ToString(InvCi) : "null")
+                  .Append(",\"maxSpeedValue\":").Append(maxSpeed is int ? ((int)maxSpeed).ToString(InvCi) : "null");
+
+                // Coverage — what the .nrd files actually contain, from NT's own reader. The Playback
+                // slider is NOT this: its bounds are the CONNECTION range you typed, not indexed data,
+                // and misreading it as proof of loaded data cost hours on 2026-08-02.
+                // Opt-in: the wide scan reads every .nrd of every instrument and holds the
+                // poller's gate for minutes (measured 2026-08-19: 3-7 min, 5 MB, 35
+                // instruments). A named instrument scans just that one (17 s).
+                bool wantCoverage = !string.IsNullOrWhiteSpace(instrument)
+                                    || string.Equals(coverageFlag, "true", StringComparison.OrdinalIgnoreCase);
+                sb.Append(",\"coverageScanned\":").Append(wantCoverage ? "true" : "false")
+                  .Append(",\"coverage\":");
+                if (wantCoverage) AppendCoverage(sb, miMinMax, instrument);
+                else sb.Append("[]");
+                sb.Append("}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{\"code\":\"BRIDGE\",\"message\":"
+                     + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        private static DateTime? ReadClock(PropertyInfo piNowEst)
+        {
+            try { if (piNowEst != null) return (DateTime)piNowEst.GetValue(null); } catch { }
+            return null;
+        }
+
+        // Per-instrument .nrd spans. `instrument` null/empty => every instrument folder under db\replay.
+        private void AppendCoverage(StringBuilder sb, MethodInfo miMinMax, string instrument)
+        {
+            sb.Append("[");
+            if (miMinMax == null) { sb.Append("]"); return; }
+            bool firstInstr = true;
+            try
+            {
+                string root = Path.Combine(Globals.UserDataDir, "db", "replay");
+                if (!Directory.Exists(root)) { sb.Append("]"); return; }
+                string[] dirs = string.IsNullOrEmpty(instrument)
+                    ? Directory.GetDirectories(root)
+                    : new[] { Path.Combine(root, instrument) };
+                foreach (string dir in dirs)
+                {
+                    if (!Directory.Exists(dir)) continue;
+                    string[] files = Directory.GetFiles(dir, "*.nrd");
+                    Array.Sort(files);
+                    DateTime lo = DateTime.MaxValue, hi = DateTime.MinValue;
+                    int ok = 0, bad = 0;
+                    var days = new StringBuilder();
+                    foreach (string f in files)
+                    {
+                        DateTime a = DateTime.MinValue, b = DateTime.MinValue;
+                        bool read = false;
+                        try
+                        {
+                            object[] args = new object[] { f, DateTime.MinValue, DateTime.MinValue };
+                            miMinMax.Invoke(null, args);
+                            a = (DateTime)args[1]; b = (DateTime)args[2];
+                            read = true;
+                        }
+                        catch { }
+                        if (days.Length > 0) days.Append(",");
+                        days.Append("{\"file\":").Append(JsonStr(Path.GetFileNameWithoutExtension(f)))
+                            .Append(",\"readable\":").Append(read ? "true" : "false")
+                            .Append(",\"from\":").Append(read ? JsonStr(a.ToString("o")) : "null")
+                            .Append(",\"to\":").Append(read ? JsonStr(b.ToString("o")) : "null")
+                            .Append(",\"bytes\":").Append(SafeLen(f).ToString(InvCi)).Append("}");
+                        if (read) { ok++; if (a < lo) lo = a; if (b > hi) hi = b; } else bad++;
+                    }
+                    if (!firstInstr) sb.Append(",");
+                    firstInstr = false;
+                    sb.Append("{\"instrument\":").Append(JsonStr(Path.GetFileName(dir)))
+                      .Append(",\"files\":").Append(files.Length.ToString(InvCi))
+                      .Append(",\"readable\":").Append(ok.ToString(InvCi))
+                      .Append(",\"unreadable\":").Append(bad.ToString(InvCi))
+                      .Append(",\"from\":").Append(ok > 0 ? JsonStr(lo.ToString("o")) : "null")
+                      .Append(",\"to\":").Append(ok > 0 ? JsonStr(hi.ToString("o")) : "null")
+                      .Append(",\"days\":[").Append(days).Append("]}");
+                }
+            }
+            catch (Exception ex) { LogSafe("AppendCoverage: " + ex.Message); }
+            sb.Append("]");
+        }
+
+        private static long SafeLen(string f)
+        {
+            try { return new FileInfo(f).Length; } catch { return -1; }
+        }
+
+        // ── ntstatus ────────────────────────────────────────────────────────────────────────────────────
+        //  "Is the code NinjaTrader is RUNNING the code that is on disk?"
+        //
+        //  ⭐ WHY: on 2026-08-02 a box ran Conductor v0.1.0 for 33 minutes while the source on disk said
+        //  v0.2.0b — the deploy had copied source without compiling, and every downstream conclusion from
+        //  that cell was worthless. The version chip was on screen the whole time and went unread.
+        //  A comparison of PROCESS START vs ASSEMBLY BUILD makes the same mistake impossible to miss, and
+        //  unlike the chip it can be read across six boxes in one command.
+        //
+        //  Answered from INSIDE NT deliberately: only this process knows which assembly it actually loaded.
+        //  The Python side additionally stats the DLL on disk, so the two can disagree — and that
+        //  disagreement IS the finding.
+        private string RunNtStatus(string id)
+        {
+            try
+            {
+                var proc = System.Diagnostics.Process.GetCurrentProcess();
+                DateTime procStart = proc.StartTime.ToUniversalTime();
+
+                string loadedPath = null, loadedVer = null;
+                DateTime? loadedBuilt = null;
+                try
+                {
+                    Assembly custom = null;
+                    foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        string n = a.GetName().Name;
+                        if (string.Equals(n, "NinjaTrader.Custom", StringComparison.OrdinalIgnoreCase)) { custom = a; break; }
+                    }
+                    if (custom != null)
+                    {
+                        loadedVer = custom.GetName().Version != null ? custom.GetName().Version.ToString() : null;
+                        try { loadedPath = custom.Location; } catch { }
+                        // An in-memory (byte[]-loaded) assembly has no Location - NT swaps NinjaScript in
+                        // that way on a reload, so an empty Location is INFORMATION, not an error.
+                        if (!string.IsNullOrEmpty(loadedPath) && File.Exists(loadedPath))
+                            loadedBuilt = File.GetLastWriteTimeUtc(loadedPath);
+                    }
+                }
+                catch (Exception ex) { LogSafe("ntstatus assembly: " + ex.Message); }
+
+                // The assembly THIS code executes from - the one NinjaTrader actually runs.
+                // Measured 2026-09-03: after a reload it is NOT bin\Custom\NinjaTrader.Custom.dll
+                // but a temp assembly (Documents\NinjaTrader 8\tmp\<guid>.dll) - NinjaTrader
+                // compiles the sources once more for loading - so neither the DLL's build time
+                // nor its identity says what runs. The executing file's own build time does.
+                string selfName = null, selfLoc = null;
+                DateTime? selfBuilt = null;
+                try
+                {
+                    Assembly self = typeof(NT8BridgeServer).Assembly;
+                    selfName = self.GetName().Name;
+                    try { selfLoc = self.Location; } catch { }
+                    if (!string.IsNullOrEmpty(selfLoc) && File.Exists(selfLoc))
+                        selfBuilt = File.GetLastWriteTimeUtc(selfLoc);
+                }
+                catch (Exception ex) { LogSafe("ntstatus self assembly: " + ex.Message); }
+
+                // The newest NinjaScript source under bin\Custom: a source newer than the
+                // executing assembly is code NinjaTrader has not compiled into what it runs -
+                // the stale-code condition (deployed, never rebuilt or reloaded).
+                string newestSrc = null;
+                DateTime? newestSrcUtc = null;
+                try
+                {
+                    string custDir = Path.Combine(Globals.UserDataDir, "bin", "Custom");
+                    foreach (string f in Directory.GetFiles(custDir, "*.cs", SearchOption.AllDirectories))
+                    {
+                        DateTime m = File.GetLastWriteTimeUtc(f);
+                        if (!newestSrcUtc.HasValue || m > newestSrcUtc.Value) { newestSrcUtc = m; newestSrc = f; }
+                    }
+                }
+                catch (Exception ex) { LogSafe("ntstatus sources: " + ex.Message); }
+
+                string dllOnDisk = Path.Combine(Globals.UserDataDir, "bin", "Custom", "NinjaTrader.Custom.dll");
+                DateTime? diskBuilt = File.Exists(dllOnDisk) ? (DateTime?)File.GetLastWriteTimeUtc(dllOnDisk) : null;
+
+                // The finding, stated rather than left for the reader to compute: a source on
+                // disk newer than the executing assembly means NinjaTrader is not running the
+                // code on disk. Reload or restart fixes it, another deploy does not. Measured
+                // 2026-09-02: three compile+reload rounds in one process started 16:02 - the
+                // old rule (DLL newer than the process) said "restart it" after every one of
+                // them while the reloaded code was what ran. The time rule against the process
+                // start remains the fallback when a side could not be read.
+                bool? sourcesNewer = null;
+                if (selfBuilt.HasValue && newestSrcUtc.HasValue)
+                    sourcesNewer = newestSrcUtc.Value > selfBuilt.Value;
+                bool stale = sourcesNewer.HasValue ? sourcesNewer.Value
+                             : (diskBuilt.HasValue && diskBuilt.Value > procStart);
+
+                var sb = new StringBuilder();
+                sb.Append("{\"id\":").Append(JsonStr(id))
+                  .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"pid\":").Append(proc.Id.ToString(InvCi))
+                  .Append(",\"processStartUtc\":").Append(JsonStr(procStart.ToString("o")))
+                  .Append(",\"ntVersion\":").Append(JsonStr(NtCoreVersion()))
+                  .Append(",\"userDataDir\":").Append(JsonStr(Globals.UserDataDir))
+                  .Append(",\"loadedAssembly\":{\"version\":").Append(JsonStr(loadedVer))
+                  .Append(",\"location\":").Append(JsonStr(loadedPath))
+                  .Append(",\"inMemory\":").Append(string.IsNullOrEmpty(loadedPath) ? "true" : "false")
+                  .Append(",\"builtUtc\":").Append(loadedBuilt.HasValue ? JsonStr(loadedBuilt.Value.ToString("o")) : "null").Append("}")
+                  .Append(",\"dllOnDisk\":{\"path\":").Append(JsonStr(dllOnDisk))
+                  .Append(",\"builtUtc\":").Append(diskBuilt.HasValue ? JsonStr(diskBuilt.Value.ToString("o")) : "null").Append("}")
+                  .Append(",\"runningAssembly\":{\"name\":").Append(JsonStr(selfName))
+                  .Append(",\"location\":").Append(JsonStr(selfLoc))
+                  .Append(",\"builtUtc\":").Append(selfBuilt.HasValue ? JsonStr(selfBuilt.Value.ToString("o")) : "null").Append("}")
+                  .Append(",\"newestSource\":{\"path\":").Append(JsonStr(newestSrc))
+                  .Append(",\"modifiedUtc\":").Append(newestSrcUtc.HasValue ? JsonStr(newestSrcUtc.Value.ToString("o")) : "null").Append("}")
+                  .Append(",\"sourcesNewerThanRunningCode\":").Append(sourcesNewer.HasValue ? (sourcesNewer.Value ? "true" : "false") : "null")
+                  .Append(",\"assemblyOlderThanDisk\":").Append(stale ? "true" : "false")
+                  .Append("}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{\"code\":\"BRIDGE\",\"message\":"
+                     + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        // ── screenshot ──────────────────────────────────────────────────────────────────────────────────
+        //  LET THE OPERATOR SEE THE SCREEN.
+        //
+        //  ⭐ WHY: 2026-08-02, and this one is a process failure rather than a code failure. A replay would
+        //  not seek on one node. Every diagnosis was made by asking the user what was on their screen and
+        //  reasoning about the answer — and the reasoning was wrong repeatedly, because a relayed screen is
+        //  a lossy channel: the Playback window and the Conductor panel were displaying two DIFFERENT clock
+        //  values the whole time and nobody noticed, because nobody was looking at both at once.
+        //
+        //  A fleet of six headless replay workers cannot be operated through a human describing a window.
+        //  ⇒ Capture the pixels and ship them back. This is the read-only sibling of `windows`: that command
+        //  says a window EXISTS, this one says what it SAYS.
+        //
+        //  ⚠ MUST run inside NinjaTrader, not over SSH. SSH lands in session 0, which owns no desktop — a
+        //  capture from there returns black, and black is worse than an error because it looks like an answer.
+        //  Running in the AddOn means running in the interactive session where the pixels actually are.
+        //
+        //  ⚠ GDI, not WPF rendering. RenderTargetBitmap would need each window's own dispatcher (NT is
+        //  multi-UI-threaded) and would miss child HWNDs and the DWM composition. PrintWindow with
+        //  PW_RENDERFULLCONTENT captures what is genuinely on screen, and Win32 is thread-agnostic — the
+        //  same reason `windows` enumerates via EnumWindows rather than Globals.AllWindows.
+        private const uint PW_RENDERFULLCONTENT = 0x00000002;
+        private const int SRCCOPY = 0x00CC0020;
+
+        private string RunScreenshot(string id, string triggerJson)
+        {
+            string title = ExtractJsonString(triggerJson, "title");
+            string hwndStr = ExtractJsonString(triggerJson, "hwnd");
+            string outPath = ExtractJsonString(triggerJson, "out");
+
+            try { SetProcessDPIAware(); } catch { }
+
+            IntPtr target = IntPtr.Zero;
+            string matched = null;
+            long parsed;
+            if (!string.IsNullOrEmpty(hwndStr) && long.TryParse(hwndStr, out parsed))
+            {
+                target = new IntPtr(parsed);
+                var tb = new StringBuilder(400);
+                GetWindowText(target, tb, tb.Capacity);
+                matched = tb.ToString();
+            }
+            else if (!string.IsNullOrEmpty(title))
+            {
+                // Substring, case-insensitive — a caller should not have to know a window's exact caption,
+                // and NT retitles windows as their content changes.
+                var found = new List<KeyValuePair<IntPtr, string>>();
+                uint self = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+                EnumWindowsProc cb = delegate(IntPtr h, IntPtr lp)
+                {
+                    try
+                    {
+                        uint pid; GetWindowThreadProcessId(h, out pid);
+                        if (pid != self || !IsWindow(h) || !IsWindowVisible(h)) return true;
+                        var tb2 = new StringBuilder(400);
+                        GetWindowText(h, tb2, tb2.Capacity);
+                        string t = tb2.ToString();
+                        if (t.Length > 0 && t.IndexOf(title, StringComparison.OrdinalIgnoreCase) >= 0)
+                            found.Add(new KeyValuePair<IntPtr, string>(h, t));
+                    }
+                    catch { }
+                    return true;
+                };
+                EnumWindows(cb, IntPtr.Zero);
+                GC.KeepAlive(cb);
+                if (found.Count == 0)
+                    return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{\"code\":\"BRIDGE\",\"message\":"
+                         + JsonStr("no visible window matching '" + title + "'") + "}]}";
+                target = found[0].Key;
+                matched = found[0].Value;
+            }
+
+            int x = 0, y = 0, w, h2;
+            bool fullScreen = target == IntPtr.Zero;
+            if (fullScreen)
+            {
+                // Virtual screen: every monitor, including negative-origin ones.
+                x = GetSystemMetrics(76); y = GetSystemMetrics(77);
+                w = GetSystemMetrics(78); h2 = GetSystemMetrics(79);
+                matched = "(virtual screen)";
+            }
+            else
+            {
+                BridgeRect r;
+                if (!GetWindowRect(target, out r))
+                    return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{\"code\":\"BRIDGE\",\"message\":\"GetWindowRect failed\"}]}";
+                w = r.Right - r.Left; h2 = r.Bottom - r.Top; x = r.Left; y = r.Top;
+                // A minimized window has a real HWND and nonsense geometry. Say so rather than return an
+                // 8x8 sliver that looks like a failed render.
+                if (IsIconic(target) || w <= 0 || h2 <= 0)
+                    return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{\"code\":\"BRIDGE\",\"message\":"
+                         + JsonStr("window is minimized or has no area (" + w + "x" + h2 + ") — restore it first") + "}]}";
+            }
+
+            if (string.IsNullOrEmpty(outPath))
+                outPath = Path.Combine(Globals.UserDataDir, "NT8Bridge", "result", "shot_" + id + ".png");
+
+            IntPtr srcDc = IntPtr.Zero, memDc = IntPtr.Zero, bmp = IntPtr.Zero, old = IntPtr.Zero;
+            try
+            {
+                srcDc = fullScreen ? GetDC(IntPtr.Zero) : GetWindowDC(target);
+                if (srcDc == IntPtr.Zero) throw new Exception("could not get a device context");
+                memDc = CreateCompatibleDC(srcDc);
+                bmp = CreateCompatibleBitmap(srcDc, w, h2);
+                old = SelectObject(memDc, bmp);
+
+                bool ok = false;
+                if (!fullScreen)
+                    ok = PrintWindow(target, memDc, PW_RENDERFULLCONTENT);
+                if (!ok)
+                    // Fallback: blit from the screen DC. Captures whatever is actually visible, so an
+                    // occluded window comes back occluded — which is the truth, not a defect.
+                    ok = BitBlt(memDc, 0, 0, w, h2, fullScreen ? srcDc : GetDC(IntPtr.Zero), x, y, SRCCOPY);
+                if (!ok) throw new Exception("both PrintWindow and BitBlt failed");
+
+                var src = System.Windows.Interop.Imaging.CreateBitmapSourceFromHBitmap(
+                    bmp, IntPtr.Zero, System.Windows.Int32Rect.Empty,
+                    System.Windows.Media.Imaging.BitmapSizeOptions.FromEmptyOptions());
+                var enc = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                enc.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(src));
+
+                string dir = Path.GetDirectoryName(outPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write))
+                    enc.Save(fs);
+
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"ok\",\"ts\":" + JsonStr(DateTime.UtcNow.ToString("o"))
+                     + ",\"path\":" + JsonStr(outPath)
+                     + ",\"window\":" + JsonStr(matched)
+                     + ",\"hwnd\":" + target.ToInt64().ToString(InvCi)
+                     + ",\"width\":" + w.ToString(InvCi) + ",\"height\":" + h2.ToString(InvCi)
+                     + ",\"bytes\":" + SafeLen(outPath).ToString(InvCi) + "}";
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{\"code\":\"BRIDGE\",\"message\":"
+                     + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+            finally
+            {
+                try { if (old != IntPtr.Zero) SelectObject(memDc, old); } catch { }
+                try { if (bmp != IntPtr.Zero) DeleteObject(bmp); } catch { }
+                try { if (memDc != IntPtr.Zero) DeleteDC(memDc); } catch { }
+                try { if (srcDc != IntPtr.Zero) ReleaseDC(fullScreen ? IntPtr.Zero : target, srcDc); } catch { }
+            }
+        }
+
+        // ── workspace ───────────────────────────────────────────────────────────────────────────────────
+        //  What is actually ON each chart: instrument, bar type, indicators, strategies + their State.
+        //
+        //  ⭐ WHY: two Gate 3 runs were lost to a strategy that was silently DISABLED — toggling the
+        //  Playback connection disables chart strategies, and on an unattended boot a workspace can restore
+        //  with the strategy off. That looks identical to a healthy run until the corpus comes back empty.
+        //  "Is my strategy enabled on both boxes?" should be one command, not an RDP session per box.
+        //
+        //  ⚠ NT IS MULTI-UI-THREADED — every window owns its own dispatcher, and reading a WPF member from
+        //  the poller thread throws "the calling thread cannot access this object" for EVERY window. So:
+        //  snapshot Globals.AllWindows (a plain collection — safe), then marshal to EACH window's OWN
+        //  dispatcher to read it. A short timeout per window so one busy chart cannot wedge the bridge.
+        //
+        //  ⚠ Read by REFLECTION with the resolved member recorded. NT's chart object model is not part of
+        //  the documented NinjaScript surface, so a hard binding is both a compile risk and a silent-wrong
+        //  risk across versions. When a member does not resolve the JSON says so rather than reporting an
+        //  empty chart — an absent reading and a zero reading are not the same claim.
+        private string RunWorkspace(string id)
+        {
+            var charts = new List<string>();
+            var notes = new List<string>();
+            try
+            {
+                var snap = new List<Window>();
+                try
+                {
+                    var all = Globals.AllWindows;
+                    if (all != null) for (int i = 0; i < all.Count; i++) snap.Add(all[i]);
+                }
+                catch (Exception ex) { notes.Add("AllWindows snapshot: " + ex.Message); }
+
+                foreach (Window w in snap)
+                {
+                    if (w == null) continue;
+                    string tn;
+                    try { tn = w.GetType().FullName; } catch { continue; }
+                    if (tn == null || tn.IndexOf("Chart", StringComparison.Ordinal) < 0) continue;
+                    if (tn.IndexOf("ChartTrader", StringComparison.Ordinal) >= 0) continue;
+
+                    Window win = w;
+                    string row = null;
+                    try
+                    {
+                        var op = win.Dispatcher.BeginInvoke(new Func<string>(delegate { return DescribeChart(win); }));
+                        // Bounded wait: a chart mid-render must not hold the poller. Silence is reported,
+                        // not swallowed — a window we could not read is a fact worth returning.
+                        if (op.Wait(TimeSpan.FromSeconds(5)) == System.Windows.Threading.DispatcherOperationStatus.Completed)
+                            row = op.Result as string;
+                        else
+                            notes.Add("chart window did not answer within 5s: " + tn);
+                    }
+                    catch (Exception ex) { notes.Add("chart read (" + tn + "): " + ex.Message); }
+                    if (row != null) charts.Add(row);
+                }
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"charts\":[],\"errors\":[{\"code\":\"BRIDGE\",\"message\":"
+                     + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+
+            var sb = new StringBuilder();
+            sb.Append("{\"id\":").Append(JsonStr(id))
+              .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+              .Append(",\"workspace\":").Append(JsonStr(CurrentWorkspaceName()))
+              .Append(",\"chartCount\":").Append(charts.Count.ToString(InvCi))
+              .Append(",\"charts\":[").Append(string.Join(",", charts.ToArray())).Append("]")
+              .Append(",\"notes\":[");
+            for (int i = 0; i < notes.Count; i++) { if (i > 0) sb.Append(","); sb.Append(JsonStr(notes[i])); }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        // Reflected, not bound: the member has moved across NT builds and is not worth a compile break.
+        private static string CurrentWorkspaceName()
+        {
+            string[] names = { "CurrentWorkspace", "Workspace", "WorkspaceName" };
+            foreach (string n in names)
+            {
+                try
+                {
+                    PropertyInfo pi = typeof(Globals).GetProperty(n, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                    if (pi != null)
+                    {
+                        object v = pi.GetValue(null, null);
+                        if (v != null) return Convert.ToString(v);
+                    }
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        // MUST be called on the chart window's OWN dispatcher (see RunWorkspace).
+        private string DescribeChart(Window win)
+        {
+            var sb = new StringBuilder();
+            string title = null;
+            try { title = win.Title; } catch { }
+            sb.Append("{\"title\":").Append(JsonStr(title))
+              .Append(",\"type\":").Append(JsonStr(SafeTypeName(win)));
+
+            object cc = FirstMember(win, new[] { "ActiveChartControl", "ChartControl" });
+            if (cc == null)
+            {
+                sb.Append(",\"chartControlResolved\":false,\"instrument\":null,\"barsPeriod\":null")
+                  .Append(",\"indicators\":null,\"strategies\":null}");
+                return sb.ToString();
+            }
+            sb.Append(",\"chartControlResolved\":true");
+
+            object instr = FirstMember(cc, new[] { "Instrument" });
+            object bp = FirstMember(cc, new[] { "BarsPeriod" });
+            sb.Append(",\"instrument\":").Append(JsonStr(instr != null ? Convert.ToString(instr) : null))
+              .Append(",\"barsPeriod\":").Append(JsonStr(bp != null ? Convert.ToString(bp) : null));
+
+            sb.Append(",\"indicators\":");
+            AppendNsList(sb, FirstMember(cc, new[] { "Indicators" }));
+            sb.Append(",\"strategies\":");
+            AppendNsList(sb, FirstMember(cc, new[] { "Strategies" }));
+
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        // NinjaScript objects (indicators/strategies) as {name, state, enabled}. `state` is NT's own State
+        // enum verbatim — Active/Realtime/Historical/Terminated — because the raw value is the evidence and
+        // any collapsing of it into a boolean is a claim we would then have to defend.
+        private void AppendNsList(StringBuilder sb, object list)
+        {
+            if (list == null) { sb.Append("null"); return; }
+            sb.Append("[");
+            try
+            {
+                var en = list as IEnumerable;
+                if (en != null)
+                {
+                    bool first = true;
+                    foreach (object o in en)
+                    {
+                        if (o == null) continue;
+                        string nm = null, st = null;
+                        // ⚠ A Sentinel tool BLANKS its own Name at DataLoaded (that is how the on-chart label
+                        // is hidden — the label IS the Name property), so `Name` is legitimately "" for most
+                        // of this suite. Fall back to the type name, or every row reads as anonymous and any
+                        // caller matching on name matches nothing. Found by running this against sentry-2.
+                        try { object v = FirstMember(o, new[] { "Name" }); nm = Convert.ToString(v); } catch { }
+                        if (string.IsNullOrEmpty(nm)) nm = SafeTypeName(o);
+                        try { object v = FirstMember(o, new[] { "State" }); st = v != null ? Convert.ToString(v) : null; } catch { }
+                        if (!first) sb.Append(",");
+                        first = false;
+                        sb.Append("{\"name\":").Append(JsonStr(nm))
+                          .Append(",\"type\":").Append(JsonStr(SafeTypeName(o)))
+                          .Append(",\"state\":").Append(JsonStr(st))
+                          .Append(",\"enabled\":").Append(st == "Active" || st == "Realtime" || st == "Historical" ? "true" : "false")
+                          .Append("}");
+                    }
+                }
+            }
+            catch (Exception ex) { LogSafe("AppendNsList: " + ex.Message); }
+            sb.Append("]");
+        }
+
+        private static string SafeTypeName(object o)
+        {
+            try { return o != null ? o.GetType().Name : null; } catch { return null; }
+        }
+
+        // First of the candidate property/field names that resolves on this object, else null.
+        private static object FirstMember(object target, string[] names)
+        {
+            if (target == null) return null;
+            Type t;
+            try { t = target.GetType(); } catch { return null; }
+            const BindingFlags bf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            foreach (string n in names)
+            {
+                try
+                {
+                    PropertyInfo pi = t.GetProperty(n, bf);
+                    if (pi != null && pi.CanRead) { object v = pi.GetValue(target, null); if (v != null) return v; }
+                }
+                catch { }
+                try
+                {
+                    FieldInfo fi = t.GetField(n, bf);
+                    if (fi != null) { object v = fi.GetValue(target); if (v != null) return v; }
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        // ── ghostorders ─────────────────────────────────────────────────────────────────────────────────
+        //  Find "ghost" orders — the stuck yellow lines that never clear — and, on a SIMULATION account,
+        //  clear them by resetting it.
+        //
+        //  ⭐ WHAT A GHOST ORDER ACTUALLY IS. Not a working order: an order wedged in a TRANSITIONAL
+        //  state that should have resolved in milliseconds and never did —
+        //      CancelPending | ChangePending | Initialized,  older than staleSeconds (default 2).
+        //  Those three states are all "NinjaTrader has asked the broker something and is waiting". A
+        //  working order sitting for hours is normal and is NOT a ghost; a CancelPending sitting for
+        //  two seconds is already wrong. That predicate is lifted from a vendor indicator that has
+        //  been solving this on this desk for a long time — it is theirs, and it is right.
+        //
+        //  ! THE PROVIDER CHECK IS AN ALLOWLIST AND MUST STAY ONE.
+        //    Reset is permitted ONLY when Provider == Provider.Simulator. Do NOT rewrite this as
+        //    "not Live" or any other denylist: real funded accounts report an unnamed provider
+        //    (observed as Provider31), so a denylist silently admits them — and this call wipes the
+        //    account. An allowlist fails closed on anything it does not recognise.
+        //
+        //  ! LIVE ACCOUNTS HAVE NO EQUIVALENT and this deliberately offers none. For those the fix is
+        //    manual: cancel externally, disconnect/reconnect every connection, and if they persist,
+        //    Control Center > Tools > Database Management > Reset DB, then restart. We report them so
+        //    you know, and refuse to touch them.
+        //
+        //  ⚠ clearTradeData DEFAULTS TO FALSE HERE, unlike the vendor which always passes true. `true`
+        //    wipes the account's trade history, and this desk's journal ingests sim fills — silently
+        //    destroying that record while "clearing a stuck order" would be a bad trade. Opt in.
+        //
+        //  request : {"id","kind":"ghostorders","account":"SimX","reset":true,
+        //             "clearTradeData":true,"staleSeconds":"2"}
+        //  response: {"id","status","ts","staleSeconds",
+        //             "accounts":[{name,provider,isSimulator,connectionStatus,orders,frozenCount,
+        //                          frozen:[{orderId,name,instrument,state,action,quantity,ageSeconds}]}],
+        //             "reset":{account,performed,clearTradeData,reason},"notes":[],"errors":[]}
+        private string RunGhostOrders(string id, string text)
+        {
+            var notes = new List<string>();
+            try
+            {
+                string acctFilter = ExtractJsonString(text, "account");
+                bool doReset      = JsonBoolFlag(text, "reset");
+                bool clearTrades  = JsonBoolFlag(text, "clearTradeData");
+                bool doCancel     = JsonBoolFlag(text, "cancel");
+                double staleSec = 2.0;
+                try { string s = ExtractJsonString(text, "staleSeconds"); if (!string.IsNullOrEmpty(s)) staleSec = double.Parse(s, InvCi); } catch { }
+                if (staleSec < 0) staleSec = 0;
+
+                var accts = new List<Account>();
+                try { lock (Account.All) { foreach (Account a in Account.All) accts.Add(a); } } catch (Exception ex) { notes.Add("Account.All: " + ex.Message); }
+
+                var rows = new List<string>();
+                Account target = null;
+                int totalFrozen = 0;
+                // The Order objects behind the STALLED rows of the targeted account. `flatten` cannot
+                // reach these: it gates on IsWorkingState, and CancelPending is deliberately not a
+                // working state, so acct.Cancel() was never called on exactly the orders that need it.
+                var cancelTargets = new List<Order>();
+                foreach (Account a in accts)
+                {
+                    string aname = SafeStr(delegate { return a.Name; });
+                    if (!string.IsNullOrEmpty(acctFilter) && aname != acctFilter) continue;
+                    if (!string.IsNullOrEmpty(acctFilter)) target = a;
+
+                    string provider = SafeStr(delegate { return a.Provider.ToString(); });
+                    bool isSim = false;
+                    try { isSim = (a.Provider == Provider.Simulator); } catch { }
+                    string connSt = SafeStr(delegate { return a.ConnectionStatus.ToString(); });
+
+                    // Snapshot under the lock, evaluate after it (Lesson #159).
+                    var snap = new List<Order>();
+                    try { lock (a.Orders) { foreach (Order o in a.Orders) snap.Add(o); } } catch { }
+
+                    // Which instruments is this account actually IN? An order is only orphaned if
+                    // nothing backs it. Snapshot under the lock, compare after.
+                    var openInstruments = new List<string>();
+                    try
+                    {
+                        lock (a.Positions)
+                        {
+                            foreach (Position pz in a.Positions)
+                            {
+                                string mp = SafeStr(delegate { return pz.MarketPosition.ToString(); });
+                                if (mp == "Flat" || mp == "") continue;
+                                openInstruments.Add(SafeStr(delegate { return pz.Instrument.FullName; }));
+                            }
+                        }
+                    }
+                    catch { }
+
+                    var frozen = new List<string>();
+                    foreach (Order o in snap)
+                    {
+                        string st = SafeStr(delegate { return o.OrderState.ToString(); });
+                        double age = -1;
+                        try { age = (DateTime.Now - o.Time).TotalSeconds; } catch { }
+
+                        // TWO kinds of ghost, and the second is the one that actually draws a stuck
+                        // yellow line on your chart.
+                        //
+                        // (a) STALLED - wedged in a transitional state that should have resolved in
+                        //     milliseconds. This is the vendor's definition and it is right, as far
+                        //     as it goes.
+                        // ! AGE CAN BE NEGATIVE, AND THAT MUST NOT SILENCE US.
+                        //   NinjaTrader stamps Order.Time in EXCHANGE time (ET); this desk's boxes run
+                        //   PT, so DateTime.Now - o.Time is about -3h for anything recent. Comparing
+                        //   `age >= staleSeconds` therefore rejected EVERY order and reported a clean
+                        //   box while a CancelPending Stop1 sat on the chart (observed 2026-09-08,
+                        //   a sim strategy on NQ, reported ageMinutes = -109). Same root cause as the known
+                        //   bridge timestamp bug.
+                        //   A staleness guard that fails CLOSED is worse than no guard: it converts a
+                        //   detector into a liar. So a negative age means "the clock comparison is not
+                        //   trustworthy here", and the order qualifies on its STATE alone - which is
+                        //   the part that actually carries the meaning. clockSkew is reported per row
+                        //   so nobody trusts the age field afterwards.
+                        bool ageUnknown = age < 0;
+                        bool oldEnough  = ageUnknown || age >= staleSec;
+
+                        bool stalled = (st == "CancelPending" || st == "ChangePending" || st == "Initialized")
+                                       && oldEnough;
+
+                        // (b) ORPHANED - alive, but nothing behind it. Observed 2026-09-08 on
+                        //     a sim strategy: a Stop1 left in a live state after its position closed and
+                        //     its OCO sibling cancelled correctly. The vendor's predicate does NOT
+                        //     see this, because the order never entered a transitional state at all -
+                        //     it simply was never resolved. That is precisely the stuck yellow line.
+                        //
+                        //     ! A resting ENTRY with no position is legitimate and extremely common,
+                        //       so this is reported as its own category and never auto-actioned on
+                        //       its own. Judgement stays with the human; the tool only surfaces it.
+                        bool live = (st == "Working" || st == "Accepted" || st == "Submitted"
+                                     || st == "TriggerPending" || st == "PartFilled"
+                                     || st == "ChangeSubmitted" || st == "CancelSubmitted");
+                        string instr = SafeStr(delegate { return o.Instrument.FullName; });
+                        bool orphaned = live && oldEnough && !openInstruments.Contains(instr);
+
+                        if (!stalled && !orphaned) continue;
+                        // ONLY stalled orders are ever cancel-targets. An ORPHANED resting entry is
+                        // legitimate and common; auto-cancelling it would destroy a live intent, so
+                        // that judgement stays with the human (see the note above).
+                        if (stalled && !string.IsNullOrEmpty(acctFilter) && aname == acctFilter)
+                            cancelTargets.Add(o);
+                        frozen.Add("{\"orderId\":" + JsonStrOrNull(SafeStr(delegate { return o.OrderId; }))
+                                 + ",\"name\":" + JsonStrOrNull(SafeStr(delegate { return o.Name; }))
+                                 + ",\"instrument\":" + JsonStrOrNull(instr)
+                                 + ",\"state\":" + JsonStrOrNull(st)
+                                 + ",\"action\":" + JsonStrOrNull(SafeStr(delegate { return o.OrderAction.ToString(); }))
+                                 + ",\"quantity\":" + SafeInt(delegate { return o.Quantity; }).ToString(InvCi)
+                                 + ",\"stopPrice\":" + SafeStr(delegate { return o.StopPrice.ToString(InvCi); })
+                                 + ",\"oco\":" + JsonStrOrNull(SafeStr(delegate { return o.Oco; }))
+                                 + ",\"kind\":" + JsonStr(stalled ? "stalled" : "orphaned")
+                                 + ",\"clockSkew\":" + (ageUnknown ? "true" : "false")
+                                 + ",\"accountHasPosition\":" + (openInstruments.Contains(instr) ? "true" : "false")
+                                 + ",\"ageSeconds\":" + ((long)age).ToString(InvCi) + "}");
+                    }
+                    totalFrozen += frozen.Count;
+
+                    // includeAll: every order in the live collection with its state, for when a chart
+                    // shows a line that the ghost predicates do not explain. Diagnostic only, capped.
+                    var allRows = new List<string>();
+                    if (JsonBoolFlag(text, "includeAll"))
+                    {
+                        int n = 0;
+                        foreach (Order o in snap)
+                        {
+                            if (++n > 60) break;
+                            double ag = -1; try { ag = (DateTime.Now - o.Time).TotalSeconds; } catch { }
+                            allRows.Add("{\"name\":" + JsonStrOrNull(SafeStr(delegate { return o.Name; }))
+                                      + ",\"state\":" + JsonStrOrNull(SafeStr(delegate { return o.OrderState.ToString(); }))
+                                      + ",\"instrument\":" + JsonStrOrNull(SafeStr(delegate { return o.Instrument.FullName; }))
+                                      + ",\"quantity\":" + SafeInt(delegate { return o.Quantity; }).ToString(InvCi)
+                                      + ",\"filled\":" + SafeInt(delegate { return o.Filled; }).ToString(InvCi)
+                                      + ",\"stopPrice\":" + SafeStr(delegate { return o.StopPrice.ToString(InvCi); })
+                                      + ",\"limitPrice\":" + SafeStr(delegate { return o.LimitPrice.ToString(InvCi); })
+                                      + ",\"ageMinutes\":" + ((long)(ag/60)).ToString(InvCi) + "}");
+                        }
+                    }
+
+                    rows.Add("{\"name\":" + JsonStrOrNull(aname)
+                           + ",\"provider\":" + JsonStrOrNull(provider)
+                           + ",\"isSimulator\":" + (isSim ? "true" : "false")
+                           + ",\"connectionStatus\":" + JsonStrOrNull(connSt)
+                           + ",\"orders\":" + snap.Count.ToString(InvCi)
+                           + ",\"frozenCount\":" + frozen.Count.ToString(InvCi)
+                           + ",\"frozen\":[" + string.Join(",", frozen.ToArray()) + "]"
+                           + ",\"allOrders\":[" + string.Join(",", allRows.ToArray()) + "]}");
+                }
+
+                // ── cancel ──────────────────────────────────────────────────────────────────────────
+                // Why this exists: --reset was the only remedy offered, and on 2026-09-21 it reported
+                // performed:true while changing NOTHING, four times across two accounts, costing ~80
+                // minutes of a live session. ResetSimulationAccount() simply does not clear an order
+                // wedged in CancelPending. acct.Cancel() does reach them - `flatten` just never passes
+                // them to it, because it filters on IsWorkingState first.
+                //
+                // ★ AND IT VERIFIES. A remedy that reports success without re-reading the state is
+                //   worse than no remedy: it sends you off to chase the wrong cause. So after
+                //   cancelling we re-scan the account and report what is ACTUALLY left.
+                string cancelJson = "null";
+                if (doCancel)
+                {
+                    string creason = null;
+                    if (string.IsNullOrEmpty(acctFilter)) creason = "cancel requires an explicit account name; it will never cancel across every account";
+                    else if (target == null)              creason = "account not found: " + acctFilter;
+
+                    int attempted = cancelTargets.Count;
+                    int stillStalled = -1;
+                    var cancelledIds = new List<string>();
+                    if (creason == null && attempted > 0)
+                    {
+                        foreach (Order o in cancelTargets)
+                            cancelledIds.Add(JsonStrOrNull(SafeStr(delegate { return o.OrderId; })));
+                        try
+                        {
+                            LogSafe("GHOSTORDERS cancel account=" + acctFilter + " orders=" + attempted);
+                            target.Cancel(cancelTargets);          // acts AFTER the locks (Lesson #159)
+                        }
+                        catch (Exception ex) { creason = "Cancel threw: " + ex.Message; }
+
+                        // Re-read rather than assume. NT8 needs a moment to process the cancels.
+                        if (creason == null)
+                        {
+                            try
+                            {
+                                System.Threading.Thread.Sleep(1200);
+                                var after = new List<Order>();
+                                lock (target.Orders) { foreach (Order o in target.Orders) after.Add(o); }
+                                stillStalled = 0;
+                                foreach (Order o in after)
+                                {
+                                    string st2 = SafeStr(delegate { return o.OrderState.ToString(); });
+                                    if (st2 == "CancelPending" || st2 == "ChangePending" || st2 == "Initialized")
+                                        stillStalled++;
+                                }
+                            }
+                            catch (Exception ex) { creason = "verify re-read threw: " + ex.Message; }
+                        }
+                    }
+                    if (creason != null) LogSafe("GHOSTORDERS cancel REFUSED/FAILED account='" + acctFilter + "': " + creason);
+                    cancelJson = "{\"account\":" + JsonStrOrNull(acctFilter)
+                               + ",\"attempted\":" + attempted.ToString(InvCi)
+                               + ",\"orderIds\":[" + string.Join(",", cancelledIds.ToArray()) + "]"
+                               + ",\"stillStalledAfter\":" + stillStalled.ToString(InvCi)
+                               + ",\"cleared\":" + ((creason == null && attempted > 0 && stillStalled == 0) ? "true" : "false")
+                               + ",\"reason\":" + JsonStrOrNull(creason) + "}";
+                }
+
+                string resetJson = "null";
+                if (doReset)
+                {
+                    string reason = null;
+                    if (string.IsNullOrEmpty(acctFilter)) reason = "reset requires an explicit account name; it will never reset every account";
+                    else if (target == null)              reason = "account not found: " + acctFilter;
+                    else
+                    {
+                        bool isSim = false;
+                        try { isSim = (target.Provider == Provider.Simulator); } catch { }
+                        // ALLOWLIST. Unknown provider => refuse.
+                        if (!isSim) reason = "'" + acctFilter + "' is provider '" + SafeStr(delegate { return target.Provider.ToString(); })
+                                           + "', not Simulator — refusing. ResetSimulationAccount is for simulation accounts only.";
+                    }
+
+                    bool performed = false;
+                    if (reason == null)
+                    {
+                        try
+                        {
+                            LogSafe("GHOSTORDERS reset account=" + acctFilter + " clearTradeData=" + clearTrades);
+                            target.ResetSimulationAccount(clearTrades);
+                            performed = true;
+                        }
+                        catch (Exception ex) { reason = "ResetSimulationAccount threw: " + ex.Message; }
+                    }
+                    if (reason != null) LogSafe("GHOSTORDERS reset REFUSED/FAILED account='" + acctFilter + "': " + reason);
+
+                    // ★ `performed` only means the CALL RETURNED. It says nothing about whether the
+                    //   ghosts actually went away, and on 2026-09-21 ResetSimulationAccount returned
+                    //   cleanly while leaving all four in CancelPending. Re-read and report the truth,
+                    //   so callers can stop trusting `performed` as an outcome.
+                    int stalledAfterReset = -1;
+                    if (performed)
+                    {
+                        try
+                        {
+                            System.Threading.Thread.Sleep(1200);
+                            var after = new List<Order>();
+                            lock (target.Orders) { foreach (Order o in target.Orders) after.Add(o); }
+                            stalledAfterReset = 0;
+                            foreach (Order o in after)
+                            {
+                                string st3 = SafeStr(delegate { return o.OrderState.ToString(); });
+                                if (st3 == "CancelPending" || st3 == "ChangePending" || st3 == "Initialized")
+                                    stalledAfterReset++;
+                            }
+                        }
+                        catch { }
+                    }
+                    resetJson = "{\"account\":" + JsonStrOrNull(acctFilter)
+                              + ",\"performed\":" + (performed ? "true" : "false")
+                              + ",\"stillStalledAfter\":" + stalledAfterReset.ToString(InvCi)
+                              + ",\"cleared\":" + ((performed && stalledAfterReset == 0) ? "true" : "false")
+                              + ",\"clearTradeData\":" + (clearTrades ? "true" : "false")
+                              + ",\"reason\":" + JsonStrOrNull(reason) + "}";
+                }
+
+                var sb = new StringBuilder();
+                sb.Append("{\"id\":").Append(JsonStr(id))
+                  .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"staleSeconds\":").Append(((int)staleSec).ToString(InvCi))
+                  .Append(",\"totalFrozen\":").Append(totalFrozen.ToString(InvCi))
+                  .Append(",\"accounts\":[").Append(string.Join(",", rows.ToArray())).Append("]")
+                  .Append(",\"cancel\":").Append(cancelJson)
+                  .Append(",\"reset\":").Append(resetJson)
+                  .Append(",\"notes\":[").Append(JoinJsonStrings(notes)).Append("]}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"accounts\":[],\"reset\":null"
+                     + ",\"notes\":[" + JoinJsonStrings(notes) + "]"
+                     + ",\"errors\":[{\"code\":\"BRIDGE\",\"message\":" + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        // ── strategies ──────────────────────────────────────────────────────────────────────────────────
+        //  Read — and change — the ENABLED state of the strategies in the Control Center's Strategies tab.
+        //
+        //  ⭐ WHY THIS IS NOT `workspace`. `workspace` walks the chart windows, so it sees only strategies
+        //  attached to a chart. The Control Center grid is the other population — strategies added in the
+        //  Strategies tab itself — and it is the one that a connection cycle turns OFF: an explicit
+        //  Connection.Disconnect() disables every running strategy, and NT8 restores none of them, not on
+        //  reconnect and not on an app restart. Answering "is it enabled, and if not turn it back on" from
+        //  a script is the difference between a box that heals and a box that needs an RDP session.
+        //
+        //  ⚠ NT8 PUBLISHES NO API FOR ANY OF THIS. Everything below is reflection into the Control Center's
+        //  own WPF tree, and three separate things make the naive version silently return nothing:
+        //
+        //    1. NT8's real windows are NOT in Application.Current.Windows (only custom AddOn windows are),
+        //       so you cannot enumerate to the Control Center. The static ControlCenter.Instance is the way in.
+        //    2. The Control Center runs on its OWN UI thread — a different one from
+        //       Globals.MainThreadDispatcher. A WPF read from the wrong thread throws "calling thread cannot
+        //       access this object", reflection re-wraps that as TargetInvocationException, and a silent
+        //       catch turns every read into null — which reads exactly like "the grid isn't there".
+        //    3. The Strategies tab is VIRTUALIZED while inactive, so the grid is not in the visual tree
+        //       until its tab is selected. Cycle SelectedIndex until it materializes, then put the user's
+        //       tab back.
+        //
+        //  ⭐ AND THE PART THAT COST THE MOST: setting StrategiesGridEntry.IsEnabled = true DOES NOT START
+        //  THE STRATEGY. The read-back says True and nothing runs — it is a one-way mirror of grid state.
+        //  Executing the grid's EnableStrategyCommand fails CanExecute (it acts on the grid SELECTION,
+        //  which is unset); the per-row EnableDisableSingleStrategyCommand does execute and does flip the
+        //  bool, and the strategy still does not start. What starts it is the checkbox's `Checked` routed
+        //  event, which executing a command never raises. So we click the real checkbox:
+        //  ButtonBase.OnClick() (protected, via reflection) — a genuine user click, fully in-process, no
+        //  synthetic mouse or keys.
+        //
+        //  ⚠ THIS REACH IS DUPLICATED. A companion connection-recovery AddOn (`AutoReconnect.cs`, not
+        //  shipped in this repo) carries its own copy — WithStrategiesGrid / GridEntries /
+        //  ToggleEnableCheckbox — because an explicit Disconnect() disables strategies and it has to put
+        //  them back. The copy is deliberate: either AddOn has to work when installed alone. But both
+        //  decode the same undocumented WPF tree, so a fix here almost certainly belongs there too.
+        //
+        //  ⚠ `enabled` (the grid's bool) IS NOT PROOF THE STRATEGY IS RUNNING. It says the click landed.
+        //  The evidence is the strategy's own `state` reaching Realtime, which is why every row carries
+        //  both and why an acting call re-reads after a settle. Believe `state`.
+        //
+        //  request : {"id","kind":"strategies","enable":"A,B","disable":"C",
+        //             "dryRun":true,"force":true,"settleMs":"3000"}
+        //  response: {"id","status","ts","gridResolved":bool,
+        //             "strategies":[{name,type,enabled,state,account,instrument}]|null,
+        //             "changed":[{name,from,to,clicked,enabled,state}],
+        //             "skipped":[{name,code,reason}], "notes":[str], "errors":[...]}
+        //  skip codes: alreadyEnabled | alreadyDisabled | notInGrid | exposure | bothLists | clickFailed
+        private const double GridInvokeTimeoutSeconds = 20.0;
+
+        // One grid row, snapshotted off the UI thread so the plan can be computed without holding it.
+        private class StratRow
+        {
+            public string Name;
+            public string Type;
+            public bool Enabled;
+            public string State;
+            public string Account;
+            public string Instrument;
+        }
+
+        private string RunStrategies(string id, string text)
+        {
+            var notes = new List<string>();
+            var changed = new List<string>();
+            var skipped = new List<string>();
+            try
+            {
+                List<string> wantOn = SplitNames(ExtractJsonString(text, "enable"));
+                List<string> wantOff = SplitNames(ExtractJsonString(text, "disable"));
+                bool dryRun = JsonBoolFlag(text, "dryRun");
+                bool force = JsonBoolFlag(text, "force");
+                int settleMs = 3000;
+                try { string s = ExtractJsonString(text, "settleMs"); if (!string.IsNullOrEmpty(s)) settleMs = int.Parse(s, InvCi); } catch { }
+                if (settleMs < 0) settleMs = 0;
+                if (settleMs > 30000) settleMs = 30000;   // the poller thread is blocked for this long
+
+                // PHASE 1 — read the grid.
+                List<StratRow> rows = WithStrategiesGrid<List<StratRow>>(delegate(object grid) { return SnapshotGrid(grid); }, notes);
+                if (rows == null)
+                    return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"gridResolved\":false,\"strategies\":null"
+                         + ",\"changed\":[],\"skipped\":[],\"notes\":[" + JoinJsonStrings(notes) + "]"
+                         + ",\"errors\":[{\"code\":\"BRIDGE\",\"message\":\"could not reach the Control Center StrategiesGrid\"}]}";
+
+                // PHASE 2 — plan, OFF the UI dispatcher. The disable guard reads Account.All/Positions/Orders,
+                // and taking a Cbi lock on the Control Center's UI thread is how you deadlock a platform whose
+                // Cbi callbacks marshal back to that same thread. Read here, act on the dispatcher later.
+                var toClick = new List<string>();
+                var wanted = new List<string>();
+                foreach (string n in wantOn) if (!wanted.Contains(n)) wanted.Add(n);
+                foreach (string n in wantOff) if (!wanted.Contains(n)) wanted.Add(n);
+                foreach (string name in wanted)
+                {
+                    bool on = wantOn.Contains(name);
+                    // Named in BOTH lists. Which list won would be decided by the order they were merged
+                    // in, and neither answer is defensible for something that starts or stops a live
+                    // strategy — so do nothing and say why.
+                    if (on && wantOff.Contains(name))
+                    {
+                        skipped.Add(SkipJson(name, "bothLists", "named in both enable and disable"));
+                        continue;
+                    }
+                    // ★ ALL matching rows, not the first. The grid permits duplicate names, and
+                    //   a strategy ends up with two the moment a template is reapplied: the
+                    //   strategy's own DisplayName override reverts both rows to "MyStrategy".
+                    //   With a first-match-and-break, an EOD sweep disables ONE of them and leaves
+                    //   the other ENABLED OVERNIGHT — silently, since the caller is told the name
+                    //   was actioned. Which one survived came down to grid order.
+                    var matches = new List<StratRow>();
+                    foreach (StratRow r in rows)
+                        if (string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)) matches.Add(r);
+                    if (matches.Count == 0) { skipped.Add(SkipJson(name, "notInGrid", "not in the Control Center strategies grid")); continue; }
+                    if (matches.Count > 1)
+                        notes.Add("'" + name + "' matches " + matches.Count.ToString(InvCi)
+                                + " grid rows; acting on ALL of them (duplicate strategy names are legal in NT8)");
+                    StratRow row = matches[0];
+                    if (row.Enabled == on)
+                    {
+                        skipped.Add(SkipJson(name, on ? "alreadyEnabled" : "alreadyDisabled",
+                                             (on ? "already enabled" : "already disabled")
+                                             + " (state=" + (row.State ?? "unknown") + ")"));
+                        continue;
+                    }
+                    if (!on && !force)
+                    {
+                        // Disabling a strategy does NOT flatten what it is holding — it stops managing it.
+                        // An open position or a working order left with nobody minding it is the one
+                        // outcome this verb must never cause by accident, so it is opt-in via force.
+                        string why = ExposureGuard(row);
+                        if (why != null) { skipped.Add(SkipJson(name, "exposure", why + " — pass force to disable anyway")); continue; }
+                    }
+                    toClick.Add(name);
+                }
+
+                if (toClick.Count > 0 && !dryRun)
+                {
+                    // PHASE 3 — click, back on the Control Center's dispatcher.
+                    var clicked = WithStrategiesGrid<List<string>>(delegate(object grid)
+                    {
+                        var okd = new List<string>();
+                        foreach (string name in toClick)
+                            if (ClickEnabledCheckbox(grid, name, wantOn.Contains(name), notes)) okd.Add(name);
+                        return okd;
+                    }, notes) ?? new List<string>();
+
+                    foreach (string name in toClick)
+                        if (!clicked.Contains(name)) skipped.Add(SkipJson(name, "clickFailed", "the Enabled checkbox for this row could not be clicked"));
+
+                    // PHASE 4 — settle, then re-read. Enabling is asynchronous: the click returns long
+                    // before the strategy walks Configure -> DataLoaded -> Realtime, so an immediate
+                    // re-read reports a transitional state and looks like a failure.
+                    if (clicked.Count > 0 && settleMs > 0) Thread.Sleep(settleMs);
+                    List<StratRow> after = WithStrategiesGrid<List<StratRow>>(delegate(object grid) { return SnapshotGrid(grid); }, notes);
+                    if (after != null) rows = after;
+                    else notes.Add("post-click re-read failed; the `strategies` list is the state BEFORE the clicks");
+
+                    foreach (string name in clicked)
+                    {
+                        bool on = wantOn.Contains(name);
+                        StratRow now = null;
+                        foreach (StratRow r in rows)
+                            if (string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase)) { now = r; break; }
+                        changed.Add("{\"name\":" + JsonStr(name)
+                                  + ",\"from\":" + (on ? "false" : "true") + ",\"to\":" + (on ? "true" : "false")
+                                  + ",\"clicked\":true"
+                                  + ",\"enabled\":" + (now != null && now.Enabled ? "true" : "false")
+                                  + ",\"state\":" + JsonStrOrNull(now != null ? now.State : null) + "}");
+                    }
+                    LogSafe("STRATEGIES enable=[" + string.Join(",", wantOn.ToArray()) + "] disable=[" + string.Join(",", wantOff.ToArray())
+                            + "] clicked=" + clicked.Count + " skipped=" + skipped.Count + (force ? " FORCE" : ""));
+                }
+                else if (toClick.Count > 0)
+                {
+                    foreach (string name in toClick)
+                    {
+                        bool on = wantOn.Contains(name);
+                        changed.Add("{\"name\":" + JsonStr(name)
+                                  + ",\"from\":" + (on ? "false" : "true") + ",\"to\":" + (on ? "true" : "false")
+                                  + ",\"clicked\":false,\"enabled\":" + (on ? "false" : "true") + ",\"state\":null}");
+                    }
+                    notes.Add("dryRun: nothing was clicked");
+                }
+
+                var sb = new StringBuilder();
+                sb.Append("{\"id\":").Append(JsonStr(id))
+                  .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"gridResolved\":true,\"dryRun\":").Append(dryRun ? "true" : "false")
+                  .Append(",\"strategies\":[");
+                for (int i = 0; i < rows.Count; i++)
+                {
+                    if (i > 0) sb.Append(",");
+                    StratRow r = rows[i];
+                    sb.Append("{\"name\":").Append(JsonStrOrNull(r.Name))
+                      .Append(",\"type\":").Append(JsonStrOrNull(r.Type))
+                      .Append(",\"enabled\":").Append(r.Enabled ? "true" : "false")
+                      .Append(",\"state\":").Append(JsonStrOrNull(r.State))
+                      .Append(",\"account\":").Append(JsonStrOrNull(r.Account))
+                      .Append(",\"instrument\":").Append(JsonStrOrNull(r.Instrument))
+                      .Append("}");
+                }
+                sb.Append("],\"changed\":[").Append(string.Join(",", changed.ToArray()))
+                  .Append("],\"skipped\":[").Append(string.Join(",", skipped.ToArray()))
+                  .Append("],\"notes\":[").Append(JoinJsonStrings(notes)).Append("]}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"gridResolved\":false,\"strategies\":null"
+                     + ",\"changed\":[],\"skipped\":[],\"notes\":[" + JoinJsonStrings(notes) + "]"
+                     + ",\"errors\":[{\"code\":\"BRIDGE\",\"message\":" + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        private static List<string> SplitNames(string csv)
+        {
+            var outp = new List<string>();
+            if (string.IsNullOrEmpty(csv)) return outp;
+            foreach (string p in csv.Split(','))
+            {
+                string t = p.Trim();
+                if (t.Length > 0 && !outp.Contains(t)) outp.Add(t);
+            }
+            return outp;
+        }
+
+        // `code` exists so a caller can branch without matching on prose. It matters most for
+        // "alreadyEnabled": asking to enable something already running is the normal shape of an
+        // idempotent caller, and reporting that identically to "refused, it holds a position" would make
+        // every retry look like a failure.
+        // JsonStr renders null as "" — fine for a label, wrong for `state`. "we could not read this
+        // strategy's state" and "its state is the empty string" are different claims, and the whole point
+        // of returning `state` alongside `enabled` is that a caller can trust it over the checkbox.
+        private static string JsonStrOrNull(string s)
+        {
+            return s == null ? "null" : JsonStr(s);
+        }
+
+        private static string SkipJson(string name, string code, string reason)
+        {
+            return "{\"name\":" + JsonStr(name) + ",\"code\":" + JsonStr(code) + ",\"reason\":" + JsonStr(reason) + "}";
+        }
+
+        private static string JoinJsonStrings(List<string> items)
+        {
+            var sb = new StringBuilder();
+            for (int i = 0; i < items.Count; i++) { if (i > 0) sb.Append(","); sb.Append(JsonStr(items[i])); }
+            return sb.ToString();
+        }
+
+        // Non-null reason when disabling this strategy would orphan live exposure. Deliberately checks the
+        // ACCOUNT's position and working orders on the instrument, not the strategy's own position: the
+        // strategy-level view can read flat while the account still carries the fill, and the conservative
+        // reading is the one worth defaulting to for something a script can trigger unattended.
+        private string ExposureGuard(StratRow row)
+        {
+            if (row == null || string.IsNullOrEmpty(row.Account)) return null;
+            try
+            {
+                Account acct = null;
+                try { lock (Account.All) { foreach (Account a in Account.All) { if (a.Name == row.Account) { acct = a; break; } } } } catch { }
+                if (acct == null) return null;
+
+                string qty = null;
+                try
+                {
+                    lock (acct.Positions)
+                    {
+                        foreach (Position p in acct.Positions)
+                        {
+                            string mp = SafeStr(delegate { return p.MarketPosition.ToString(); });
+                            if (mp == "Flat" || mp == "") continue;
+                            string fn = SafeStr(delegate { return p.Instrument.FullName; });
+                            if (!string.IsNullOrEmpty(row.Instrument) && fn != row.Instrument) continue;
+                            qty = mp + " " + SafeInt(delegate { return p.Quantity; }).ToString(InvCi) + " " + fn;
+                            break;
+                        }
+                    }
+                }
+                catch { }
+                if (qty != null) return "open position on " + row.Account + " (" + qty + ")";
+
+                int working = 0;
+                try
+                {
+                    lock (acct.Orders)
+                    {
+                        foreach (Order o in acct.Orders)
+                        {
+                            if (!IsWorkingState(SafeStr(delegate { return o.OrderState.ToString(); }))) continue;
+                            string fn = SafeStr(delegate { return o.Instrument.FullName; });
+                            if (!string.IsNullOrEmpty(row.Instrument) && fn != row.Instrument) continue;
+                            working++;
+                        }
+                    }
+                }
+                catch { }
+                if (working > 0) return working + " working order(s) on " + row.Account;
+            }
+            catch (Exception ex) { LogSafe("ExposureGuard: " + ex.Message); }
+            return null;
+        }
+
+        // Reach ControlCenter.Instance. NT8's real windows are not enumerable via Application.Current.Windows.
+        private static object GetControlCenter()
+        {
+            try
+            {
+                Type cc = Type.GetType("NinjaTrader.Gui.ControlCenter, NinjaTrader.Gui");
+                if (cc == null) return null;
+                foreach (string sm in new[] { "Instance", "Current" })
+                {
+                    PropertyInfo sp = cc.GetProperty(sm, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                    if (sp != null) { object v = sp.GetValue(null, null); if (v != null) return v; }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static System.Windows.DependencyObject FindDescendantByTypeName(System.Windows.DependencyObject root, string contains)
+        {
+            try
+            {
+                int n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(root);
+                for (int i = 0; i < n; i++)
+                {
+                    System.Windows.DependencyObject child = System.Windows.Media.VisualTreeHelper.GetChild(root, i);
+                    if (child == null) continue;
+                    if (child.GetType().Name.IndexOf(contains, StringComparison.OrdinalIgnoreCase) >= 0) return child;
+                    System.Windows.DependencyObject deeper = FindDescendantByTypeName(child, contains);
+                    if (deeper != null) return deeper;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // Run `fn` against the live StrategiesGrid on the Control Center's OWN dispatcher, with the
+        // Strategies tab realized, then restore the user's tab. Returns default(T) — for a reference type,
+        // null — when the grid could not be reached, which callers MUST distinguish from an empty result:
+        // "we could not read the grid" and "there are no strategies" are different claims.
+        private T WithStrategiesGrid<T>(Func<object, T> fn, List<string> notes)
+        {
+            object cc = GetControlCenter();
+            if (cc == null) { notes.Add("ControlCenter.Instance is null"); return default(T); }
+            System.Windows.Threading.Dispatcher disp = null;
+            try { disp = ((System.Windows.Threading.DispatcherObject)cc).Dispatcher; } catch (Exception ex) { notes.Add("ControlCenter dispatcher: " + ex.Message); }
+
+            Func<T> body = delegate
+            {
+                object mtc = null; int savedIdx = -1; PropertyInfo selProp = null;
+                try
+                {
+                    System.Windows.DependencyObject dep = cc as System.Windows.DependencyObject;
+                    mtc = FirstMember(cc, new[] { "MainTabControl" });
+                    if (mtc == null) { notes.Add("ControlCenter.MainTabControl did not resolve"); return default(T); }
+                    Type mt = mtc.GetType();
+                    selProp = mt.GetProperty("SelectedIndex");
+                    try { object si = FirstMember(mtc, new[] { "SelectedIndex" }); if (si is int) savedIdx = (int)si; } catch { }
+
+                    System.Windows.DependencyObject grid = dep != null ? FindDescendantByTypeName(dep, "StrategiesGrid") : null;
+                    if (grid == null)
+                    {
+                        // The tab content virtualizes while inactive, so the grid is simply not in the tree
+                        // yet. Activate tabs until it materializes — the index is NOT stable across boxes.
+                        object items = FirstMember(mtc, new[] { "Items" });
+                        int count = 0;
+                        try { PropertyInfo cp = items != null ? items.GetType().GetProperty("Count") : null; if (cp != null) count = (int)cp.GetValue(items, null); } catch { }
+                        for (int i = 0; i < count && grid == null; i++)
+                        {
+                            try { if (selProp != null) selProp.SetValue(mtc, i, null); } catch { continue; }
+                            try { ((System.Windows.UIElement)mtc).UpdateLayout(); } catch { }
+                            grid = dep != null ? FindDescendantByTypeName(dep, "StrategiesGrid") : null;
+                        }
+                    }
+                    if (grid == null) { notes.Add("StrategiesGrid not found after activating every Control Center tab"); return default(T); }
+                    return fn(grid);
+                }
+                catch (Exception ex) { notes.Add("grid: " + ex.Message); return default(T); }
+                finally
+                {
+                    try { if (mtc != null && selProp != null && savedIdx >= 0) { selProp.SetValue(mtc, savedIdx, null); ((System.Windows.UIElement)mtc).UpdateLayout(); } }
+                    catch (Exception ex) { notes.Add("restoring the Control Center tab: " + ex.Message); }
+                }
+            };
+
+            // BOUNDED wait. `body` activates tabs and calls UpdateLayout, so on a saturated UI dispatcher an
+            // untimed Invoke blocks this poller thread indefinitely and the whole bridge stops answering.
+            // Losing one grid read costs this request; losing the poller costs every other command.
+            try
+            {
+                if (disp != null && !disp.CheckAccess())
+                    return disp.Invoke(body, System.Windows.Threading.DispatcherPriority.Normal, CancellationToken.None,
+                                       TimeSpan.FromSeconds(GridInvokeTimeoutSeconds));
+                return body();
+            }
+            catch (TimeoutException)
+            {
+                notes.Add("the Control Center UI dispatcher did not respond within " + (int)GridInvokeTimeoutSeconds + "s (saturated)");
+                return default(T);
+            }
+            catch (Exception ex) { notes.Add("grid dispatch: " + ex.Message); return default(T); }
+        }
+
+        // ⚠ The name a row is ADDRESSED by. `Name` is legitimately blank on some strategies (a tool that
+        // hides its on-chart label does it by blanking Name), so both the snapshot and the checkbox lookup
+        // must fall back to the type name — and to the SAME thing. When only one of them did, every
+        // blank-named strategy listed fine and then failed to enable with "could not identify the Enabled
+        // checkbox", because the row it was matching against reported "".
+        private static string StrategyDisplayName(object strat)
+        {
+            if (strat == null) return null;
+            string nm = null;
+            try { nm = FirstMember(strat, new[] { "Name" }) as string; } catch { }
+            return string.IsNullOrEmpty(nm) ? SafeTypeName(strat) : nm;
+        }
+
+        // Grid rows come off `source`; each entry carries .Strategy (a live StrategyBase) and .IsEnabled.
+        private List<StratRow> SnapshotGrid(object grid)
+        {
+            var outp = new List<StratRow>();
+            object rows = FirstMember(grid, new[] { "source", "Entries", "ItemsSource" });
+            if (!(rows is IEnumerable)) return outp;
+            foreach (object entry in (IEnumerable)rows)
+            {
+                if (entry == null) continue;
+                try
+                {
+                    object strat = FirstMember(entry, new[] { "Strategy" });
+                    object en = FirstMember(entry, new[] { "IsEnabled" });
+                    object acct = strat != null ? FirstMember(strat, new[] { "Account" }) : null;
+                    object instr = strat != null ? FirstMember(strat, new[] { "Instrument" }) : null;
+                    object st = strat != null ? FirstMember(strat, new[] { "State" }) : null;
+                    outp.Add(new StratRow
+                    {
+                        Name = StrategyDisplayName(strat),
+                        Type = SafeTypeName(strat),
+                        Enabled = en is bool && (bool)en,
+                        State = st != null ? Convert.ToString(st) : null,
+                        Account = acct != null ? Convert.ToString(FirstMember(acct, new[] { "Name" }) ?? Convert.ToString(acct)) : null,
+                        Instrument = instr != null ? Convert.ToString(FirstMember(instr, new[] { "FullName" }) ?? Convert.ToString(instr)) : null,
+                    });
+                }
+                catch (Exception ex) { LogSafe("SnapshotGrid row: " + ex.Message); }
+            }
+            return outp;
+        }
+
+        private static void CollectToggleButtons(System.Windows.DependencyObject root, List<System.Windows.Controls.Primitives.ToggleButton> outp)
+        {
+            if (root == null) return;
+            try
+            {
+                int n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(root);
+                for (int i = 0; i < n; i++)
+                {
+                    System.Windows.DependencyObject c = System.Windows.Media.VisualTreeHelper.GetChild(root, i);
+                    var tb = c as System.Windows.Controls.Primitives.ToggleButton;
+                    if (tb != null) outp.Add(tb);
+                    CollectToggleButtons(c, outp);
+                }
+            }
+            catch { }
+        }
+
+        // Walk up from a checkbox to the first DataContext that names a strategy. The grid is an
+        // Infragistics XamDataGrid, so a checkbox's DataContext is a cell/record wrapper — the entry is
+        // reached through .DataItem, not directly.
+        private static string RowNameOf(System.Windows.DependencyObject el)
+        {
+            try
+            {
+                System.Windows.DependencyObject cur = el;
+                for (int hop = 0; hop < 14 && cur != null; hop++)
+                {
+                    var fe = cur as System.Windows.FrameworkElement;
+                    if (fe != null && fe.DataContext != null)
+                    {
+                        object dc = fe.DataContext;
+                        object s = FirstMember(dc, new[] { "Strategy" });
+                        if (s == null)
+                        {
+                            object di = FirstMember(dc, new[] { "DataItem" });
+                            if (di != null) s = FirstMember(di, new[] { "Strategy" });
+                        }
+                        if (s != null)
+                        {
+                            string nm = StrategyDisplayName(s);
+                            if (!string.IsNullOrEmpty(nm)) return nm;
+                        }
+                    }
+                    cur = System.Windows.Media.VisualTreeHelper.GetParent(cur);
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        // Click the row's real Enabled checkbox. See the header: this is the ONLY path that actually starts
+        // (or stops) the strategy — IsEnabled and the routed commands both flip state without it.
+        private bool ClickEnabledCheckbox(object grid, string name, bool wantEnabled, List<string> notes)
+        {
+            // ★ Duplicate names are LEGAL in the grid, and a strategy acquires them every time a
+            //   template is reapplied (the DisplayName override reverts both rows to "MyStrategy").
+            //   Clicking only the first match meant an EOD sweep disabled ONE instance and left the
+            //   other running overnight, while reporting the name as actioned. Every row carrying
+            //   this name that is in the wrong state gets clicked.
+            bool cur = false; bool found = false; int rowsWithName = 0, rowsNeedingClick = 0;
+            foreach (StratRow r in SnapshotGrid(grid))
+                if (string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    rowsWithName++;
+                    if (!found) { cur = r.Enabled; found = true; }
+                    if (r.Enabled != wantEnabled) rowsNeedingClick++;
+                }
+            if (!found) { notes.Add("'" + name + "': row vanished from the grid before the click"); return false; }
+            if (rowsNeedingClick == 0) return true;
+            if (rowsWithName > 1)
+                notes.Add("'" + name + "': " + rowsWithName.ToString(InvCi) + " rows share this name, "
+                        + rowsNeedingClick.ToString(InvCi) + " need the click");
+
+            var boxes = new List<System.Windows.Controls.Primitives.ToggleButton>();
+            CollectToggleButtons(grid as System.Windows.DependencyObject, boxes);
+            var matches = new List<System.Windows.Controls.Primitives.ToggleButton>();
+            foreach (var b in boxes)
+            {
+                string bn = ""; try { bn = b.Name; } catch { }
+                if (bn == "ExpansionIndicator") continue;   // the tree expander, not the Enabled column
+                if (string.Equals(RowNameOf(b), name, StringComparison.OrdinalIgnoreCase)) matches.Add(b);
+            }
+            // The Enabled checkbox mirrors the current state, which is what tells it apart from any other
+            // toggle that happens to sit on the row.
+            // The Enabled checkbox mirrors its row's state, which is what tells it apart from any
+            // other toggle on the row — so "needs changing" is exactly "IsChecked != wantEnabled".
+            var toToggle = new List<System.Windows.Controls.Primitives.ToggleButton>();
+            foreach (var b in matches)
+            {
+                bool? ck = null; try { ck = b.IsChecked; } catch { }
+                if (ck.HasValue && ck.Value != wantEnabled) toToggle.Add(b);
+            }
+            if (toToggle.Count == 0 && matches.Count == 1) toToggle.Add(matches[0]);
+            if (toToggle.Count == 0)
+            {
+                notes.Add("'" + name + "': could not identify the Enabled checkbox (" + boxes.Count + " toggles in the grid, " + matches.Count + " on this row)");
+                return false;
+            }
+            try
+            {
+                MethodInfo onClick = typeof(System.Windows.Controls.Primitives.ButtonBase)
+                    .GetMethod("OnClick", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (onClick == null) { notes.Add("ButtonBase.OnClick is not reachable on this .NET build"); return false; }
+                int hit = 0;
+                foreach (var b in toToggle) { onClick.Invoke(b, null); hit++; }
+                if (hit < rowsNeedingClick)
+                    notes.Add("'" + name + "': clicked " + hit.ToString(InvCi) + " of " + rowsNeedingClick.ToString(InvCi)
+                            + " rows needing it — re-read `strategies` and repeat if one is still wrong");
+                return hit > 0;
+            }
+            catch (Exception ex)
+            {
+                notes.Add("'" + name + "' click: " + (ex.InnerException != null ? ex.InnerException.GetType().Name + " " + ex.InnerException.Message : ex.Message));
+                return false;
+            }
+        }
+
+        private string RunCompile(string id)
+        {
+            return RunCompileCore(id, false);
+        }
+
+        // ── compile vs reload ────────────────────────────────────────────────────────────────────
+        //  `checkCompileOnly` is the ONLY difference, and it is the difference between "does this
+        //  code build" and "is this code now RUNNING".
+        //
+        //    compile  (checkCompileOnly = TRUE)  — validates the tree and emits nothing. Fast, and it
+        //             disturbs nothing: no indicator reloads, no strategy restarts, no chart flicker.
+        //             This is what you want in an edit loop.
+        //    reload   (checkCompileOnly = FALSE) — a real build. NinjaTrader swaps in the new
+        //             NinjaScript assembly exactly as the Editor's F5 does, so new TYPES appear in the
+        //             pickers and existing indicators reload. This is the step that used to require a
+        //             human pressing F5.
+        //
+        //  ⚠ reload is DISRUPTIVE by nature: it restarts indicators and can interrupt a running
+        //  strategy, and on this suite it also orphans bars-type instances (they are NOT recreated by
+        //  a reload or a chart reload — only by an NT restart). Never fire it into a live bake.
+        //  Kept as a SEPARATE command rather than a flag on compile so it can never happen by accident.
+        private string RunCompileCore(string id, bool reload)
+        {
+            Type compilerType = Type.GetType("NinjaTrader.Code.Compiler, NinjaTrader.Core");
+            if (compilerType == null) throw new Exception("NinjaTrader.Code.Compiler not found");
+            MethodInfo compile = compilerType.GetMethod("Compile", BindingFlags.Public | BindingFlags.Static);
+            if (compile == null) throw new Exception("Compiler.Compile(...) not found");
+
+            var empty = new List<string>();
+            // checkCompileOnly, debugBuild=false, filesToIgnore=[], filesInTmp=[]
+            object emit = compile.Invoke(null, new object[] { !reload, false, empty, empty });
+
+            // Report the reload HONESTLY: only a non-check build that actually succeeded swapped the
+            // assembly. Previously this field was hardcoded false, which made a real reload
+            // indistinguishable from a check — the caller could never tell whether its code was live.
+            bool ok = EmitSucceeded(emit);
+            return BuildResultJson(id, emit, reload && ok);
+        }
+
+        // ═════════════════════════════════════════════════════════════════════════════════════════
+        //  windows — an inventory of NinjaTrader's top-level windows.
+        //
+        //  ⚠ WIN32 ONLY, AND THIS IS NOT A STYLE CHOICE. NinjaTrader runs EACH WINDOW ON ITS OWN
+        //  DISPATCHER THREAD, so reading `w.Left` / `.ActualWidth` / `.IsVisible` / `.WindowState`
+        //  from this poller thread throws `InvalidOperationException: The calling thread cannot access
+        //  this object because a different thread owns it` — on every window, every time. A handler
+        //  written against WPF properties returns an empty list and looks like "NT has no windows".
+        //  GetWindowRect / IsWindowVisible / IsIconic / IsZoomed are thread-agnostic; use those.
+        //
+        //  `Globals.AllWindows` is only touched to collect HWNDs (cheap, no geometry), and even that
+        //  is snapshotted first because the collection mutates as windows open and close.
+        // ═════════════════════════════════════════════════════════════════════════════════════════
+        [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr h, out BridgeRect r);
+        [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr h);
+        [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] private static extern bool IsZoomed(IntPtr h);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BridgeRect { public int Left, Top, Right, Bottom; }
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr p);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+
+        // ── screenshot P/Invoke ─────────────────────────────────────────────────────────────────────────
+        //  GDI, not System.Drawing: the encode goes through WPF's PngBitmapEncoder (PresentationCore, which
+        //  this suite already depends on everywhere) so nothing new has to be referenced to build.
+        [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr h);
+        [DllImport("user32.dll")] private static extern IntPtr GetWindowDC(IntPtr h);
+        [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr h, IntPtr dc);
+        [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+        [DllImport("user32.dll")] private static extern int GetSystemMetrics(int i);
+        [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
+        [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleDC(IntPtr dc);
+        [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleBitmap(IntPtr dc, int w, int h);
+        [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+        [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr obj);
+        [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr dc);
+        [DllImport("gdi32.dll")] private static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h,
+                                                                   IntPtr src, int sx, int sy, int rop);
+
+        private string RunWindows(string id)
+        {
+            //  ⚠ ENUMERATED VIA WIN32, NOT VIA Globals.AllWindows.
+            //
+            //  The first version of this walked `Globals.AllWindows` and called
+            //  `new WindowInteropHelper(w).Handle` to get each HWND. That THROWS: WindowInteropHelper
+            //  reads the Window's HwndSource, which is thread-affine like every other WPF member, so
+            //  from the poller thread it raises "The calling thread cannot access this object because
+            //  a different thread owns it" for EVERY window and the handler returns an empty list —
+            //  a confident `status:"ok", count:0` that looks like NinjaTrader has no windows.
+            //
+            //  You cannot even obtain the HANDLE off-thread. So do not start from WPF objects at all:
+            //  EnumWindows filtered by our own process id is completely thread-agnostic, needs no
+            //  dispatcher marshalling (which could deadlock against a busy window thread), and also
+            //  catches top-level windows that never appear in Globals.AllWindows.
+            var rows = new List<string>();
+            try
+            {
+                uint self = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+                // Held in a local so the GC cannot collect the delegate while EnumWindows runs.
+                EnumWindowsProc cb = delegate(IntPtr h, IntPtr lp)
+                {
+                    try
+                    {
+                        uint pid;
+                        GetWindowThreadProcessId(h, out pid);
+                        if (pid != self || !IsWindow(h)) return true;
+
+                        var title = new StringBuilder(400);
+                        GetWindowText(h, title, title.Capacity);
+                        var cls = new StringBuilder(200);
+                        GetClassName(h, cls, cls.Capacity);
+
+                        // Untitled HWNDs are message-only//tooltip/layered helpers, not real windows.
+                        if (title.Length == 0) return true;
+
+                        BridgeRect r;
+                        bool got = GetWindowRect(h, out r);
+                        rows.Add("{\"hwnd\":" + h.ToInt64().ToString(InvCi) +
+                                 ",\"title\":" + JsonStr(title.ToString()) +
+                                 ",\"class\":" + JsonStr(cls.ToString()) +
+                                 ",\"visible\":" + (IsWindowVisible(h) ? "true" : "false") +
+                                 ",\"minimized\":" + (IsIconic(h) ? "true" : "false") +
+                                 ",\"maximized\":" + (IsZoomed(h) ? "true" : "false") +
+                                 ",\"left\":" + (got ? r.Left : 0).ToString(InvCi) +
+                                 ",\"top\":" + (got ? r.Top : 0).ToString(InvCi) +
+                                 ",\"width\":" + (got ? r.Right - r.Left : 0).ToString(InvCi) +
+                                 ",\"height\":" + (got ? r.Bottom - r.Top : 0).ToString(InvCi) + "}");
+                    }
+                    catch (Exception ex) { LogSafe("RunWindows row: " + ex.Message); }
+                    return true;
+                };
+                EnumWindows(cb, IntPtr.Zero);
+                GC.KeepAlive(cb);
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"message\":" + JsonStr(ex.Message) + "}";
+            }
+            return "{\"id\":" + JsonStr(id) + ",\"status\":\"ok\",\"count\":" + rows.Count.ToString(InvCi) +
+                   ",\"windows\":[" + string.Join(",", rows.ToArray()) + "]}";
+        }
+
+        private static bool EmitSucceeded(object emit)
+        {
+            try
+            {
+                if (emit == null) return true;               // no result object == nothing to complain about
+                PropertyInfo succ = emit.GetType().GetProperty("Success");
+                return succ == null || (bool)succ.GetValue(emit, null);
+            }
+            catch { return false; }
+        }
+
+        // --- Part 3: run a backtest by firing the SA's RunCommand (the exact
+        // RoutedCommand the Run button uses — routes through OnRun, runs on a
+        // background thread, SAFE), then polling the tab's Results for the
+        // completed run and reading its SystemPerformance. The user configures
+        // the SA tab (strategy + instrument + dates); the bridge clicks Run.
+        // (Calling StrategyRunner.RunStrategyAsync directly hangs the UI — do not.) ---
+        private Window FindStrategyAnalyzerWindow()
+        {
+            var all = Globals.AllWindows;
+            if (all == null) return null;
+            var snap = new List<Window>();
+            try { for (int i = 0; i < all.Count; i++) snap.Add(all[i]); }
+            catch { }
+            foreach (Window w in snap)
+                if (w != null && w.GetType().FullName.IndexOf("StrategyAnalyzer", StringComparison.Ordinal) >= 0)
+                    return w;
+            return null;
+        }
+
+        // ===== Live chart data-series control (chartseries) =====
+        // Thin handler: parse the trigger, then delegate find-chart + resolve + OnDataSeriesChanged to the
+        // shared ChartDataSeriesSwitcher (the ChartScheduler reuses the same engine). The switcher is
+        // invoked by REFLECTION on purpose: the offline precheck compiles ONE .cs against the prebuilt
+        // Custom.dll, so a direct type reference to the sibling (not yet in that DLL) would be CS0246; at
+        // runtime both files compile into NinjaTrader.Custom.dll and Type.GetType resolves it.
+        // Reproduces NRDToCSV's full-depth export (mode 2) server-side: the exact MarketReplay engine,
+        // no window. Writes the raw L1+L2 dump straight to outPath, returns the row count. Instrument
+        // resolution matches NRDToCSV (InstrumentList.GetInstruments) so output is byte-faithful.
+        // NOTE: DumpMarketDepth runs inline under the poller gate, so a dump SERIALIZES the bridge for
+        // its duration (other trigger kinds wait). One-day dumps are quick and the Python client's
+        // per-date timeout governs; a pathologically hung dump would block the bridge (heartbeat keeps
+        // beating, so the watchdog would not restart) — acceptable for the batch-export use case.
+        private string RunMarketReplayDump(string id, string text)
+        {
+            try
+            {
+                string instrName = ExtractJsonString(text, "instrument");
+                string dateStr   = ExtractJsonString(text, "date");
+                string outPath   = ExtractJsonString(text, "outPath");
+                string mode      = ExtractJsonString(text, "mode");
+                if (string.IsNullOrEmpty(mode)) mode = "depth";
+                if (mode != "depth")
+                    return CsErr(id, "only mode=depth is supported in this build (got '" + mode + "')");
+                if (string.IsNullOrEmpty(instrName) || string.IsNullOrEmpty(dateStr) || string.IsNullOrEmpty(outPath))
+                    return CsErr(id, "marketReplayDump requires instrument, date (YYYYMMDD), outPath");
+
+                DateTime day;
+                if (!DateTime.TryParseExact(dateStr, "yyyyMMdd",
+                        InvCi, System.Globalization.DateTimeStyles.None, out day))
+                    return CsErr(id, "bad date (expected YYYYMMDD): " + dateStr);
+
+                Instrument inst = null;
+                try
+                {
+                    var matches = InstrumentList.GetInstruments(instrName);
+                    if (matches != null && matches.Count > 1)
+                        return CsErr(id, "ambiguous instrument name: " + instrName);
+                    if (matches != null && matches.Count == 1)
+                        inst = matches[0];
+                }
+                catch { }
+                if (inst == null) return CsErr(id, "instrument not found: " + instrName);
+
+                try { string dir = System.IO.Path.GetDirectoryName(outPath); if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir); } catch { }
+
+                MarketReplay.DumpMarketDepth(inst, day, day, outPath);
+
+                long rows = 0;
+                try { using (var sr = new System.IO.StreamReader(outPath)) { while (sr.ReadLine() != null) rows++; } } catch { }
+
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"ok\",\"rows\":" + rows.ToString(InvCi)
+                     + ",\"outPath\":" + JsonStr(outPath) + "}";
+            }
+            catch (Exception ex) { return CsErr(id, "marketReplayDump: " + ex.Message); }
+        }
+
+        // Download ONE day of MarketReplay data for an instrument, then return. Uses the connection's
+        // HDS client's RequestMarketReplay(instrument, dateEst, Action<ErrorCode,string,object>, IProgress,
+        // state) via reflection — the same path the community MultidayReplayDownloader uses. The call is
+        // async under the hood; we block the poller on a ManualResetEvent until the callback fires, so a
+        // download SERIALIZES the bridge for its duration (like marketReplayDump; the heartbeat runs off a
+        // separate beat so the watchdog won't restart). Writes db/replay/<FullName>/<yyyyMMdd>.nrd.
+        // The Python client loops dates + skips existing; this handler always attempts the requested date.
+        private string RunMarketReplayDownload(string id, string text)
+        {
+            try
+            {
+                string instrName = ExtractJsonString(text, "instrument");
+                string dateStr   = ExtractJsonString(text, "date");
+                if (string.IsNullOrEmpty(instrName) || string.IsNullOrEmpty(dateStr))
+                    return CsErr(id, "marketReplayDownload requires instrument, date (YYYYMMDD)");
+
+                DateTime day;
+                if (!DateTime.TryParseExact(dateStr, "yyyyMMdd", InvCi,
+                        System.Globalization.DateTimeStyles.None, out day))
+                    return CsErr(id, "bad date (expected YYYYMMDD): " + dateStr);
+
+                Instrument inst = null;
+                try
+                {
+                    var matches = InstrumentList.GetInstruments(instrName);
+                    if (matches != null && matches.Count > 1)
+                        return CsErr(id, "ambiguous instrument name: " + instrName);
+                    if (matches != null && matches.Count == 1)
+                        inst = matches[0];
+                }
+                catch { }
+                if (inst == null) return CsErr(id, "instrument not found: " + instrName);
+
+                object hdsClient; MethodInfo requestMethod;
+                ResolveMarketReplayRequester(out hdsClient, out requestMethod);
+                if (hdsClient == null || requestMethod == null)
+                    return CsErr(id, "no MarketReplay download service — need an active data connection "
+                                   + "(Tradovate/Continuum) logged in");
+
+                // Heavy MNQ days (~500 MB) take 300-460s; the wait is client-configurable via
+                // "timeoutSec" (histget passes its --timeout) so a slow day isn't false-reported as a
+                // timeout while NT8 finishes the download in the background. Default 600s.
+                double waitSec = 600;
+                string toStr = ExtractJsonString(text, "timeoutSec");
+                if (!string.IsNullOrEmpty(toStr))
+                {
+                    double t;
+                    if (double.TryParse(toStr, System.Globalization.NumberStyles.Any, InvCi, out t) && t > 0)
+                        waitSec = t;
+                }
+
+                ErrorCode ec = ErrorCode.NoError; string emsg = null;
+                using (var done = new ManualResetEventSlim(false))
+                {
+                    Action<ErrorCode, string, object> cb = (code, msg, state) =>
+                    { ec = code; emsg = msg; try { done.Set(); } catch { } };
+                    // (Instrument, DateTime dateEst[ET], callback, IProgress, object state)
+                    requestMethod.Invoke(hdsClient, new object[] { inst, day, cb, null, null });
+                    if (!done.Wait(TimeSpan.FromSeconds(waitSec)))
+                        return CsErr(id, "download timed out (" + waitSec.ToString("0", InvCi)
+                                       + "s) for " + dateStr);
+                }
+                if (ec != ErrorCode.NoError)
+                    return CsErr(id, "download " + ec.ToString()
+                                   + (string.IsNullOrEmpty(emsg) ? "" : ": " + emsg) + " (" + dateStr + ")");
+
+                string nrdPath = System.IO.Path.Combine(Globals.UserDataDir, "db", "replay",
+                                                        inst.FullName, dateStr + ".nrd");
+                bool exists = System.IO.File.Exists(nrdPath);
+                long bytes = 0;
+                try { if (exists) bytes = new System.IO.FileInfo(nrdPath).Length; } catch { }
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"ok\",\"date\":" + JsonStr(dateStr)
+                     + ",\"instrument\":" + JsonStr(inst.FullName) + ",\"nrd\":" + JsonStr(nrdPath)
+                     + ",\"exists\":" + (exists ? "true" : "false") + ",\"bytes\":" + bytes.ToString(InvCi) + "}";
+            }
+            catch (Exception ex)
+            {
+                Exception e = ex.InnerException ?? ex;
+                return CsErr(id, "marketReplayDownload: " + e.Message);
+            }
+        }
+
+        // Reflection: find a connection's HDS client (HistoricalDataClient or Adapter) that exposes
+        // RequestMarketReplay. Mirrors the community MultidayReplayDownloader's discovery: try
+        // Connection.ClientConnection (HistoricalDataClient, else Adapter), then scan Connection.Connections.
+        private void ResolveMarketReplayRequester(out object hdsClient, out MethodInfo requestMethod)
+        {
+            hdsClient = null; requestMethod = null;
+            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            try
+            {
+                if (Connection.ClientConnection != null)
+                {
+                    var prop = Connection.ClientConnection.GetType().GetProperty("HistoricalDataClient", F);
+                    if (prop != null) hdsClient = prop.GetValue(Connection.ClientConnection);
+                    if (hdsClient == null)
+                    {
+                        var adapterProp = Connection.ClientConnection.GetType()
+                            .GetProperty("Adapter", BindingFlags.Public | BindingFlags.Instance);
+                        if (adapterProp != null)
+                        {
+                            var adapter = adapterProp.GetValue(Connection.ClientConnection);
+                            if (adapter != null)
+                            {
+                                var m = adapter.GetType().GetMethod("RequestMarketReplay", F);
+                                if (m != null) { hdsClient = adapter; requestMethod = m; }
+                            }
+                        }
+                    }
+                }
+                if (hdsClient == null && Connection.Connections != null)
+                {
+                    foreach (Connection conn in Connection.Connections)
+                    {
+                        if (conn == null) continue;
+                        var prop = conn.GetType().GetProperty("HistoricalDataClient", F);
+                        if (prop != null)
+                        {
+                            var client = prop.GetValue(conn);
+                            if (client != null) { hdsClient = client; break; }
+                        }
+                    }
+                }
+                if (hdsClient != null && requestMethod == null)
+                    requestMethod = hdsClient.GetType().GetMethod("RequestMarketReplay", F);
+            }
+            catch { }
+        }
+
+        // Trigger schema (Task 3): {id, kind:"chartseries", target:{mode:"active|instrument|title", value?},
+        //   dataseries:{instrument?, barsPeriodType?, barsPeriodValue?, barsPeriodValue2?, baseBarsPeriodValue?}, force}.
+        // PARSE SCOPING: target.mode's VALUE can be "instrument"/"title", so slice each nested object and
+        // parse its keys from that slice; force is the lone top-level bool (JsonBoolFlag).
+        private string RunChartSeries(string id, string triggerJson)
+        {
+            string targetObj = ExtractJsonObject(triggerJson, "target");
+            string dataObj = ExtractJsonObject(triggerJson, "dataseries");
+
+            string mode = ExtractJsonString(targetObj, "mode");
+            if (string.IsNullOrEmpty(mode)) mode = "active";
+            string targetValue = ExtractJsonString(targetObj, "value");
+            string newInstrName = ExtractJsonString(dataObj, "instrument");
+            string btype = ExtractJsonString(dataObj, "barsPeriodType");
+            bool force = JsonBoolFlag(triggerJson, "force");
+
+            // barsPeriodType may be an enum NAME ("Minute") or a numeric custom id ("12345"/"2018").
+            int typeId = -1;   // -1 => keep the chart's current bar type
+            if (!string.IsNullOrEmpty(btype))
+            {
+                int parsed;
+                if (int.TryParse(btype, out parsed)) typeId = parsed;
+                else
+                {
+                    try { typeId = (int)(BarsPeriodType)Enum.Parse(typeof(BarsPeriodType), btype, true); }
+                    catch { return CsErr(id, "unknown barsPeriodType: " + btype); }
+                }
+            }
+            object v  = ParseNullableInt(ExtractJsonString(dataObj, "barsPeriodValue"));
+            object v2 = ParseNullableInt(ExtractJsonString(dataObj, "barsPeriodValue2"));
+            object bv = ParseNullableInt(ExtractJsonString(dataObj, "baseBarsPeriodValue"));
+
+            // Delegate to the shared switcher (reflection -- see note above). title -> by tab name;
+            // active -> empty tab name (switcher targets the active/sole chart); instrument -> by the
+            // chart's current instrument.
+            object sr;
+            if (mode == "instrument")
+                sr = InvokeSwitcher("SwitchByInstrument", new object[] { targetValue, newInstrName, typeId, v, v2, bv, null, force });
+            else
+                sr = InvokeSwitcher("Switch", new object[] { mode == "title" ? targetValue : "", newInstrName, typeId, v, v2, bv, null, force });
+
+            if (sr == null) return CsErr(id, "ChartDataSeriesSwitcher unavailable (not compiled into Custom.dll?)");
+
+            string status = SrStr(sr, "Status");      // ok | blocked | missing | error
+            string message = SrStr(sr, "Message");
+            bool have = status == "ok" || status == "blocked";
+            string jsonStatus = status == "ok" ? "ok" : (status == "blocked" ? "blocked" : "error");
+
+            if (!have)
+                return "{\"id\":" + JsonStr(id) + ",\"status\":" + JsonStr(jsonStatus) + ",\"matched\":0"
+                     + ",\"chart\":null,\"message\":" + JsonStr(message)
+                     + ",\"errors\":[{\"code\":\"BRIDGE\",\"message\":" + JsonStr(message) + "}]}";
+
+            string before = "{\"instrument\":" + JsonStr(SrStr(sr, "BeforeInstrument")) + ",\"bars\":" + JsonStr(SrStr(sr, "BeforeBars")) + "}";
+            string after  = "{\"instrument\":" + JsonStr(SrStr(sr, "AfterInstrument"))  + ",\"bars\":" + JsonStr(SrStr(sr, "AfterBars"))  + "}";
+            return "{\"id\":" + JsonStr(id) + ",\"status\":" + JsonStr(jsonStatus) + ",\"matched\":1,\"chart\":{\"title\":"
+                 + JsonStr(SrStr(sr, "Title")) + ",\"before\":" + before + ",\"after\":" + after + "},\"message\":"
+                 + JsonStr(message) + ",\"errors\":[]}";
+        }
+
+        // Invoke a static method on the sibling ChartDataSeriesSwitcher by reflection (same assembly at
+        // runtime). Returns the SwitchResult object, or null if the type/method is unavailable.
+        private object InvokeSwitcher(string method, object[] args)
+        {
+            try
+            {
+                Type t = Type.GetType("NinjaTrader.NinjaScript.AddOns.ChartDataSeriesSwitcher");
+                if (t == null) return null;
+                MethodInfo m = t.GetMethod(method, BindingFlags.Public | BindingFlags.Static);
+                if (m == null) return null;
+                return m.Invoke(null, args);
+            }
+            catch (Exception ex) { LogSafe("InvokeSwitcher " + method + ": " + ex.Message); return null; }
+        }
+
+        // read a public string property off the reflected SwitchResult.
+        private static string SrStr(object sr, string name)
+        {
+            try { PropertyInfo p = sr.GetType().GetProperty(name); object v = p != null ? p.GetValue(sr, null) : null; return v != null ? v.ToString() : ""; }
+            catch { return ""; }
+        }
+
+        // "5" -> boxed int 5 ; "" / non-numeric -> null (boxed for the int? reflection parameter).
+        private static object ParseNullableInt(string s)
+        {
+            int x;
+            return (!string.IsNullOrEmpty(s) && int.TryParse(s, out x)) ? (object)x : null;
+        }
+
+        private string CsErr(string id, string msg)
+        {
+            return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"matched\":0,\"chart\":null,\"message\":" + JsonStr(msg)
+                 + ",\"errors\":[{\"code\":\"BRIDGE\",\"message\":" + JsonStr(msg) + "}]}";
+        }
+
+        // true only if the JSON carries the KEY  "<key>": true  (ExtractJsonString reads only quoted
+        // values, so a bare boolean must be parsed here). Matches the "<key>" occurrence immediately
+        // followed by ':' -- so a string VALUE that happens to equal the key (e.g. --on-title "force")
+        // cannot trip it.
+        private static bool JsonBoolFlag(string json, string key)
+        {
+            if (json == null) return false;
+            string pat = "\"" + key + "\"";
+            int from = 0;
+            while (true)
+            {
+                int i = json.IndexOf(pat, from, StringComparison.Ordinal);
+                if (i < 0) return false;
+                int j = i + pat.Length;
+                while (j < json.Length && char.IsWhiteSpace(json[j])) j++;
+                if (j < json.Length && json[j] == ':')   // KEY occurrence (followed by a colon)
+                {
+                    j++;
+                    while (j < json.Length && char.IsWhiteSpace(json[j])) j++;
+                    return json.Length - j >= 4 && json.Substring(j, 4) == "true";
+                }
+                from = i + pat.Length;   // a string VALUE equal to the key -> keep scanning for the real key
+            }
+        }
+
+        private static SystemPerformance LatestPerf(StrategyAnalyzerTabControl tab)
+        {
+            if (tab == null || tab.Results == null || tab.Results.Count == 0) return null;
+            StrategyAnalyzerGridEntry e = tab.Results[tab.Results.Count - 1];
+            return e != null ? e.Results : null;
+        }
+
+        // Read-only: capture the SA tab's latest completed result WITHOUT firing a new Run,
+        // PLUS a read-back of the strategy template's current NinjaScriptProperty inputs (so the
+        // caller can verify param injection actually took — a wrong-params run looks valid otherwise).
+        private string RunPeek(string id)
+        {
+            Window saWin = FindStrategyAnalyzerWindow();
+            if (saWin == null) return BtErr(id, "no Strategy Analyzer window open");
+            try
+            {
+                return (string)saWin.Dispatcher.Invoke(new Func<string>(delegate
+                {
+                    try
+                    {
+                        StrategyAnalyzerViewModel vm = saWin.DataContext as StrategyAnalyzerViewModel;
+                        StrategyAnalyzerTabControl tab = vm != null ? vm.SelectedTab : null;
+                        if (tab == null) return BtErr(id, "no active SA tab");
+                        StrategyBase strat = (tab.TabStrategyProperties != null) ? tab.TabStrategyProperties.StrategyTemplate : null;
+                        string prm = ParamReadback(strat);
+                        SystemPerformance perf = LatestPerf(tab);
+                        if (perf == null)
+                            return "{\"id\":" + JsonStr(id) + ",\"status\":\"ok\",\"metrics\":null,\"note\":"
+                                + JsonStr("no completed result in the SA grid (run one first)") + ",\"params\":" + prm + "}";
+                        string bt = BuildBacktestJson(id, perf, strat != null ? strat.Name : "");
+                        if (bt.EndsWith("}")) bt = bt.Substring(0, bt.Length - 1) + ",\"params\":" + prm + "}";
+                        return bt;
+                    }
+                    catch (Exception ex) { return BtErr(id, "peek read: " + ex.Message); }
+                }));
+            }
+            catch (Exception ex) { return BtErr(id, "peek: " + ex.Message); }
+        }
+
+        // Read every public read/write property carrying a NinjaScriptProperty attribute (the
+        // strategy's user inputs) -> {name: "value"}. Generic across strategies.
+        private string ParamReadback(StrategyBase strat)
+        {
+            if (strat == null) return "null";
+            var sb = new StringBuilder("{");
+            bool first = true;
+            foreach (PropertyInfo p in strat.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                try
+                {
+                    if (!p.CanRead || !p.CanWrite) continue;
+                    bool isInput = false;
+                    foreach (object a in p.GetCustomAttributes(false))
+                        if (a.GetType().Name.IndexOf("NinjaScriptProperty", StringComparison.Ordinal) >= 0) { isInput = true; break; }
+                    if (!isInput) continue;
+                    object v = p.GetValue(strat, null);
+                    if (!first) sb.Append(",");
+                    sb.Append(JsonStr(p.Name)).Append(":").Append(JsonStr(v != null ? v.ToString() : "null"));
+                    first = false;
+                }
+                catch { }
+            }
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        // Probe: reflect on tab + tab.TabStrategyProperties + StrategyTemplate. Emits each
+        // public read/write property with name, type, and current value (string repr). Used
+        // to DISCOVER property names before writing a `configure` config — NT8's SA tab
+        // members are partly obfuscated so naive guessing wastes cycles. Read-only.
+        private string RunProbe(string id)
+        {
+            Window saWin = FindStrategyAnalyzerWindow();
+            if (saWin == null) return BtErr(id, "no Strategy Analyzer window open");
+            try
+            {
+                return (string)saWin.Dispatcher.Invoke(new Func<string>(delegate
+                {
+                    try
+                    {
+                        StrategyAnalyzerViewModel vm = saWin.DataContext as StrategyAnalyzerViewModel;
+                        StrategyAnalyzerTabControl tab = vm != null ? vm.SelectedTab : null;
+                        if (tab == null) return BtErr(id, "no active SA tab");
+                        object tsp = tab.TabStrategyProperties;
+                        object strat = (tsp != null) ? tab.TabStrategyProperties.StrategyTemplate : null;
+                        var sb = new StringBuilder("{\"id\":").Append(JsonStr(id));
+                        sb.Append(",\"status\":\"ok\",\"tab\":");
+                        DumpProps(sb, tab);
+                        sb.Append(",\"tabStrategyProperties\":");
+                        DumpProps(sb, tsp);
+                        sb.Append(",\"strategyTemplate\":");
+                        DumpProps(sb, strat);
+                        sb.Append("}");
+                        return sb.ToString();
+                    }
+                    catch (Exception ex) { return BtErr(id, "probe: " + ex.Message); }
+                }));
+            }
+            catch (Exception ex) { return BtErr(id, "probe outer: " + ex.Message); }
+        }
+
+        private static void DumpProps(StringBuilder sb, object o)
+        {
+            if (o == null) { sb.Append("null"); return; }
+            sb.Append("{\"_type\":").Append(JsonStr(o.GetType().FullName)).Append(",\"properties\":[");
+            bool first = true;
+            foreach (PropertyInfo p in o.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                string val, repr;
+                try
+                {
+                    object v = p.CanRead ? p.GetValue(o, null) : null;
+                    val = v != null ? v.ToString() : "null";
+                    repr = "ok";
+                }
+                catch (Exception ex) { val = ex.Message; repr = "throw"; }
+                if (!first) sb.Append(",");
+                sb.Append("{\"name\":").Append(JsonStr(p.Name))
+                  .Append(",\"type\":").Append(JsonStr(p.PropertyType.FullName))
+                  .Append(",\"canWrite\":").Append(p.CanWrite ? "true" : "false")
+                  .Append(",\"value\":").Append(JsonStr(val))
+                  .Append(",\"repr\":").Append(JsonStr(repr))
+                  .Append("}");
+                first = false;
+            }
+            sb.Append("]}");
+        }
+
+        // Configure: write each key in the trigger's "params" map to whichever of
+        // (tab, tab.TabStrategyProperties, strategyTemplate) has a matching writable
+        // property. Type-aware: Instrument is created via Instrument.GetInstrument(name);
+        // DateTime/TimeSpan/Enum parsed explicitly; ints/doubles via Convert.ChangeType.
+        // Returns a per-key result list so the caller can verify what landed where.
+        // (Intended replacement for the manual "open SA tab + click everything" step
+        //  before each backtest sweep.)
+        //
+        // ⚠ THE StrategyTemplate IS SWAPPED OUT WHEN "Strategy" IS WRITTEN. NT8 installs a
+        //   fresh instance of the newly selected strategy, so a template reference resolved
+        //   before the key loop then points at the PREVIOUS, detached object. SetValue on a
+        //   detached object does not throw, so every key after Strategy reported "set" and
+        //   echoed its value back while the tab kept its old data series -- and the backtest
+        //   that followed ran, successfully, on settings the caller believed it had replaced.
+        //   Two things are needed to close that, and only together:
+        //     1. resolve the targets PER KEY (rescues the keys written after the swap), and
+        //     2. write the swap keys FIRST (rescues the keys written before it).
+        //   Reported by Quantrosoft as issue #6 on the public repo (verified on 8.1.8.2).
+        private string RunConfigure(string id, string triggerJson)
+        {
+            Window saWin = FindStrategyAnalyzerWindow();
+            if (saWin == null) return BtErr(id, "no Strategy Analyzer window open");
+            Dictionary<string, string> prms = ParseParams(triggerJson);
+            try
+            {
+                return (string)saWin.Dispatcher.Invoke(new Func<string>(delegate
+                {
+                    try
+                    {
+                        StrategyAnalyzerViewModel vm = saWin.DataContext as StrategyAnalyzerViewModel;
+                        StrategyAnalyzerTabControl tab = vm != null ? vm.SelectedTab : null;
+                        if (tab == null) return BtErr(id, "no active SA tab");
+                        string[] targetNames = new string[] { "tab", "tabStrategyProperties", "strategyTemplate" };
+                        // Called before EVERY write and again for every read-back. The template
+                        // this returns is only guaranteed to be the live one at the moment it is
+                        // asked for -- which is the whole lesson of issue #6.
+                        StrategyAnalyzerTabControl tabRef = tab;
+                        Func<object[]> resolve = new Func<object[]>(delegate
+                        {
+                            object tsp = tabRef.TabStrategyProperties;
+                            object strat = (tsp != null) ? tabRef.TabStrategyProperties.StrategyTemplate : null;
+                            return new object[] { tabRef, tsp, strat };
+                        });
+                        var sb = new StringBuilder("{\"id\":").Append(JsonStr(id))
+                            .Append(",\"status\":\"ok\",\"applied\":[");
+                        bool first = true;
+                        foreach (var kv in ConfigKeysSwapFirst(prms))
+                        {
+                            string outcome = TrySetOnTargets(resolve, targetNames, kv.Key, kv.Value);
+                            if (!first) sb.Append(",");
+                            sb.Append(outcome);
+                            first = false;
+                        }
+                        sb.Append("]}");
+                        return sb.ToString();
+                    }
+                    catch (Exception ex) { return BtErr(id, "configure: " + ex.Message); }
+                }));
+            }
+            catch (Exception ex) { return BtErr(id, "configure outer: " + ex.Message); }
+        }
+
+        // Keys whose write REPLACES tab.TabStrategyProperties.StrategyTemplate.
+        private static readonly string[] TemplateSwapKeys = new string[] { "Strategy" };
+
+        // ParseParams hands back a Dictionary, and Dictionary iteration order is not part of its
+        // contract -- so "Strategy processed last" was always reachable and was never a caller's
+        // typo. Hoisting the swap keys is what makes ONE configure call carrying Strategy plus
+        // data-series keys behave like the two-call workaround (Strategy alone, then the rest).
+        // Measured on the live SA tab: From / To / BarsPeriod / IsTickReplay are writable ONLY on
+        // the template, so those are precisely the keys a mis-ordered call drops. (Instrument-
+        // OrInstrumentList exists on tabStrategyProperties too, which is earlier in the target
+        // list and survives the swap -- which is why the instrument looked applied while the bar
+        // type and date range silently did not.)
+        private static List<KeyValuePair<string, string>> ConfigKeysSwapFirst(Dictionary<string, string> prms)
+        {
+            var swap = new List<KeyValuePair<string, string>>();
+            var rest = new List<KeyValuePair<string, string>>();
+            foreach (KeyValuePair<string, string> kv in prms)
+            {
+                bool isSwap = false;
+                for (int i = 0; i < TemplateSwapKeys.Length; i++)
+                    if (string.Equals(kv.Key, TemplateSwapKeys[i], StringComparison.OrdinalIgnoreCase)) { isSwap = true; break; }
+                (isSwap ? swap : rest).Add(kv);
+            }
+            swap.AddRange(rest);
+            return swap;
+        }
+
+        // Walk targets in order; first one with a writable property of matching name wins.
+        // Returns one JSON object per key: {"key":..,"target":..,"status":"set|skip|error",..}
+        //
+        // `resolve` is invoked for the write and AGAIN for the read-back, so "nowReads" comes off
+        // a freshly resolved chain rather than off the reference just written to. That is the
+        // point: a detached StrategyTemplate reads its own value back quite happily -- only the
+        // live chain shows the tab still holding the old one. It is reported as a VALUE and never
+        // as a verdict, because setters legitimately transform (BarsPeriod "77077:120:1" reads
+        // back as "Wave 120"), and an equality check here would manufacture false failures.
+        private static string TrySetOnTargets(Func<object[]> resolve, string[] names, string key, string token)
+        {
+            object[] targets = resolve();
+            for (int ti = 0; ti < targets.Length; ti++)
+            {
+                if (targets[ti] == null) continue;
+                PropertyInfo p = targets[ti].GetType().GetProperty(key, BindingFlags.Public | BindingFlags.Instance);
+                if (p == null || !p.CanWrite) continue;
+                try
+                {
+                    object v = ConvertConfigToken(token, p.PropertyType);
+                    p.SetValue(targets[ti], v, null);
+                    return "{\"key\":" + JsonStr(key) + ",\"target\":" + JsonStr(names[ti])
+                         + ",\"status\":\"set\",\"to\":" + JsonStr(v != null ? v.ToString() : "null")
+                         + ",\"nowReads\":" + JsonStr(ReadBackLive(resolve, names, names[ti], key)) + "}";
+                }
+                catch (Exception ex)
+                {
+                    return "{\"key\":" + JsonStr(key) + ",\"target\":" + JsonStr(names[ti])
+                         + ",\"status\":\"error\",\"message\":" + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}";
+                }
+            }
+            return "{\"key\":" + JsonStr(key) + ",\"status\":\"skip\",\"message\":\"no writable property of this name on tab/tabStrategyProperties/strategyTemplate\"}";
+        }
+
+        // Read `key` back off a FRESHLY resolved target of the same name, so the answer describes
+        // the tab rather than the object we happen to be holding. Never throws and never fails the
+        // write it reports on: evidence that can break the call it is observing is worse than none.
+        private static string ReadBackLive(Func<object[]> resolve, string[] names, string targetName, string key)
+        {
+            try
+            {
+                object[] fresh = resolve();
+                for (int ti = 0; ti < fresh.Length && ti < names.Length; ti++)
+                {
+                    if (names[ti] != targetName) continue;
+                    if (fresh[ti] == null) return "(target is null)";
+                    PropertyInfo p = fresh[ti].GetType().GetProperty(key, BindingFlags.Public | BindingFlags.Instance);
+                    if (p == null || !p.CanRead) return "(unreadable)";
+                    object v = p.GetValue(fresh[ti], null);
+                    return v != null ? v.ToString() : "null";
+                }
+                return "(target gone)";
+            }
+            catch (Exception ex) { return "(read-back failed: " + ex.Message + ")"; }
+        }
+
+        // Type-aware token -> value conversion. Extends ConvertToken with Instrument
+        // (factory lookup by FullName), DateTime (ISO yyyy-MM-dd or yyyy-MM-ddTHH:mm:ss),
+        // and falls back to ConvertToken for primitive/enum/string/TimeSpan.
+        private static object ConvertConfigToken(string token, Type t)
+        {
+            string raw = token == null ? null : token.Trim();
+            if (raw != null && raw.Length >= 2 && raw[0] == '"' && raw[raw.Length - 1] == '"')
+                raw = raw.Substring(1, raw.Length - 2).Replace("\\\"", "\"").Replace("\\\\", "\\");
+            Type nt = Nullable.GetUnderlyingType(t) ?? t;
+            if (nt == typeof(Instrument)) return Instrument.GetInstrument(raw);
+            if (nt == typeof(DateTime))   return DateTime.Parse(raw, System.Globalization.CultureInfo.InvariantCulture);
+            if (nt == typeof(BarsPeriod))
+            {
+                // "Second:1" / "Minute:1" / "Tick:1" — type:value[:value2] form. The optional third
+                // part sets Value2 for two-parameter bar types (e.g. a custom add-on type like
+                // NinzaRenko: "12345:64:16" = type 12345, brick 64 / reversal 16). A numeric type
+                // token parses straight through Enum.Parse to (BarsPeriodType)value, so custom add-on
+                // bar types (which register an int BarsPeriodType, not a named enum member) work too.
+                string[] parts = raw.Split(':');
+                BarsPeriodType bpType = (BarsPeriodType)Enum.Parse(typeof(BarsPeriodType), parts[0], true);
+                int val = parts.Length > 1 ? int.Parse(parts[1]) : 1;
+                BarsPeriod bp = new BarsPeriod { BarsPeriodType = bpType, Value = val };
+                if (parts.Length > 2) bp.Value2 = int.Parse(parts[2]);
+                return bp;
+            }
+            return ConvertToken(token, t);
+        }
+
+        private void RunBacktest(string id, Dictionary<string, string> prms)
+        {
+            Window saWin = FindStrategyAnalyzerWindow();
+            if (saWin == null)
+            {
+                WriteResult("backtest_" + id + ".json", BtErr(id, "no Strategy Analyzer window open"));
+                return;
+            }
+            saWin.Dispatcher.BeginInvoke(new Action(delegate
+            {
+                try
+                {
+                    StrategyAnalyzerViewModel vm = saWin.DataContext as StrategyAnalyzerViewModel;
+                    if (vm == null) { WriteResult("backtest_" + id + ".json", BtErr(id, "SA DataContext is not a StrategyAnalyzerViewModel")); return; }
+                    StrategyAnalyzerTabControl tab = vm.SelectedTab;
+                    if (tab == null) { WriteResult("backtest_" + id + ".json", BtErr(id, "no active SA tab")); return; }
+
+                    // Inject config.json params onto the configured template before running.
+                    if (prms != null && prms.Count > 0 && tab.TabStrategyProperties != null && tab.TabStrategyProperties.StrategyTemplate != null)
+                        InjectParams(tab.TabStrategyProperties.StrategyTemplate, prms);
+
+                    // Capture the current latest result's SystemPerformance so the poll can
+                    // detect a NEW one. The SA REPLACES the result on a re-run (Results.Count
+                    // stays the same), so a count-based check misses every run after the first.
+                    SystemPerformance prevPerf = LatestPerf(tab);
+
+                    RoutedCommand rc = StrategyAnalyzerViewModel.RunCommand as RoutedCommand;
+                    if (rc == null) { WriteResult("backtest_" + id + ".json", BtErr(id, "RunCommand is not a RoutedCommand")); return; }
+                    if (!rc.CanExecute(null, saWin)) { WriteResult("backtest_" + id + ".json", BtErr(id, "RunCommand.CanExecute=false — configure the SA tab (strategy + instrument + dates) first")); return; }
+
+                    // Button-equivalent: routes through OnRun on a background thread (safe).
+                    LogSafe("backtest: executing RunCommand (had prior result=" + (prevPerf != null) + ")");
+                    rc.Execute(null, saWin);
+                    StartResultPoll(id, saWin, prevPerf);
+                }
+                catch (Exception ex)
+                {
+                    LogSafe("RunBacktest: " + ex.Message);
+                    WriteResult("backtest_" + id + ".json", BtErr(id, ex.GetType().Name + ": " + ex.Message));
+                }
+            }));
+        }
+
+        // Set config.json params onto the configured strategy template by property
+        // name (reflection). Values are converted to each property's type
+        // (int/double/bool/enum/string). Unknown or read-only props are skipped.
+        private void InjectParams(StrategyBase strat, Dictionary<string, string> prms)
+        {
+            foreach (var kv in prms)
+            {
+                try
+                {
+                    PropertyInfo p = strat.GetType().GetProperty(kv.Key, BindingFlags.Public | BindingFlags.Instance);
+                    if (p == null || !p.CanWrite) { LogSafe("param skip (no writable prop '" + kv.Key + "')"); continue; }
+                    p.SetValue(strat, ConvertToken(kv.Value, p.PropertyType), null);
+                    LogSafe("param set: " + kv.Key + "=" + kv.Value);
+                }
+                catch (Exception ex) { LogSafe("param set failed '" + kv.Key + "': " + ex.Message); }
+            }
+        }
+
+        private static object ConvertToken(string token, Type t)
+        {
+            token = token.Trim();
+            bool quoted = token.Length >= 2 && token[0] == '"' && token[token.Length - 1] == '"';
+            string raw = quoted
+                ? token.Substring(1, token.Length - 2).Replace("\\\"", "\"").Replace("\\\\", "\\")
+                : token;
+            Type nt = Nullable.GetUnderlyingType(t) ?? t;
+            if (nt.IsEnum) return Enum.Parse(nt, raw, true);
+            if (nt == typeof(bool)) return bool.Parse(raw);
+            if (nt == typeof(string)) return raw;
+            // TimeSpan is NOT IConvertible (Convert.ChangeType throws) -- common NT8 input type
+            // for session Start/End times. Parse "HH:mm[:ss]" explicitly. (Session-based
+            // strategies expose StartTime/EndTime as TimeSpan; without this they silently skip-inject.)
+            if (nt == typeof(TimeSpan)) return TimeSpan.Parse(raw, System.Globalization.CultureInfo.InvariantCulture);
+            return Convert.ChangeType(raw, nt, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        // Minimal flat-JSON parser for the trigger's "params" object -> name->rawToken
+        // (no JSON-lib dependency, so the AddOn stays offline-precheckable).
+        private static Dictionary<string, string> ParseParams(string json)
+        {
+            var d = new Dictionary<string, string>();
+            if (json == null) return d;
+            int pi = json.IndexOf("\"params\"", StringComparison.Ordinal);
+            if (pi < 0) return d;
+            int open = json.IndexOf('{', pi);
+            if (open < 0) return d;
+            int depth = 0, close = -1; bool inStr = false, esc = false;
+            for (int i = open; i < json.Length; i++)
+            {
+                char c = json[i];
+                if (inStr) { if (esc) esc = false; else if (c == '\\') esc = true; else if (c == '"') inStr = false; continue; }
+                if (c == '"') inStr = true;
+                else if (c == '{') depth++;
+                else if (c == '}') { depth--; if (depth == 0) { close = i; break; } }
+            }
+            if (close < 0) return d;
+            string body = json.Substring(open + 1, close - open - 1);
+            var pairs = new List<string>();
+            int start = 0; depth = 0; inStr = false; esc = false;
+            for (int i = 0; i < body.Length; i++)
+            {
+                char c = body[i];
+                if (inStr) { if (esc) esc = false; else if (c == '\\') esc = true; else if (c == '"') inStr = false; continue; }
+                if (c == '"') inStr = true;
+                else if (c == '{' || c == '[') depth++;
+                else if (c == '}' || c == ']') depth--;
+                else if (c == ',' && depth == 0) { pairs.Add(body.Substring(start, i - start)); start = i + 1; }
+            }
+            pairs.Add(body.Substring(start));
+            foreach (string pair in pairs)
+            {
+                int colon = TopLevelColon(pair);
+                if (colon < 0) continue;
+                string key = pair.Substring(0, colon).Trim();
+                if (key.Length >= 2 && key[0] == '"' && key[key.Length - 1] == '"') key = key.Substring(1, key.Length - 2);
+                string val = pair.Substring(colon + 1).Trim();
+                if (key.Length > 0) d[key] = val;
+            }
+            return d;
+        }
+
+        private static int TopLevelColon(string s)
+        {
+            bool inStr = false, esc = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (inStr) { if (esc) esc = false; else if (c == '\\') esc = true; else if (c == '"') inStr = false; continue; }
+                if (c == '"') inStr = true;
+                else if (c == ':') return i;
+            }
+            return -1;
+        }
+
+        // Poll the SA tab's Results (wall-clock, off-thread, read-only) for a new
+        // completed run, then write its SystemPerformance. Caps at ~45 min
+        // (tick-resolution intrabar fills over long ranges take far longer than 5 min).
+        private void StartResultPoll(string id, Window saWin, SystemPerformance prevPerf)
+        {
+            int[] ticks = { 0 };
+            Timer[] tref = new Timer[1];
+            tref[0] = new Timer(delegate
+            {
+                try
+                {
+                    ticks[0]++;
+                    string json = (string)saWin.Dispatcher.Invoke(new Func<string>(delegate
+                    {
+                        try
+                        {
+                            StrategyAnalyzerViewModel vm = saWin.DataContext as StrategyAnalyzerViewModel;
+                            StrategyAnalyzerTabControl tab = vm != null ? vm.SelectedTab : null;
+                            if (tab == null || tab.Results == null || tab.Results.Count == 0) return null;
+                            StrategyAnalyzerGridEntry entry = tab.Results[tab.Results.Count - 1];
+                            if (entry == null || entry.Results == null) return null;        // running / not populated
+                            if (ReferenceEquals(entry.Results, prevPerf)) return null;       // still the previous result
+                            return BuildBacktestJson(id, entry.Results, entry.StrategyName); // a NEW SystemPerformance
+                        }
+                        catch { return null; }
+                    }));
+                    if (json != null)
+                    {
+                        WriteResult("backtest_" + id + ".json", json);
+                        LogSafe("backtest: result captured for " + id);
+                        try { tref[0].Dispose(); } catch { }
+                    }
+                    else if (ticks[0] >= 1350)
+                    {
+                        WriteResult("backtest_" + id + ".json",
+                            BtErr(id, "no completed result within ~45 min (run may still be going, or produced no new Results entry)"));
+                        try { tref[0].Dispose(); } catch { }
+                    }
+                }
+                catch (Exception ex) { LogSafe("ResultPoll: " + ex.Message); }
+            }, null, 2000, 2000);
+        }
+
+        private string BuildBacktestJson(string id, SystemPerformance perf, string stratName)
+        {
+            if (perf == null) return BtErr(id, "no SystemPerformance");
+            TradeCollection all = perf.AllTrades;
+            int nTrades = all != null ? all.Count : 0;
+
+            var sb = new StringBuilder();
+            sb.Append("{\"id\":").Append(JsonStr(id)).Append(",\"status\":\"ok\",\"strategy\":")
+              .Append(JsonStr(stratName != null ? stratName : "")).Append(",\"metrics\":{");
+            sb.Append("\"totalTrades\":").Append(nTrades);
+            if (all != null && all.TradesPerformance != null)
+            {
+                TradesPerformance tp = all.TradesPerformance;
+                sb.Append(",\"profitFactor\":").Append(Num(tp.ProfitFactor));
+                if (tp.Currency != null)
+                {
+                    sb.Append(",\"netProfit\":").Append(Num(tp.Currency.CumProfit));
+                    sb.Append(",\"maxDrawdown\":").Append(Num(tp.Currency.Drawdown));
+                }
+            }
+            sb.Append("},\"trades\":[");
+            StopIndex stops = null;
+            if (all != null)
+            {
+                // Each trade's absolute stop level, from the backtest's protective stop orders
+                // (e.g. EventFadeNFP's "EFStop"). The stop is in the order history whether it
+                // FILLED (stop exit) or was CANCELLED (time or target exit), so a time-exit trade
+                // gets its stop LEVEL too -- the parity comparator checks the stop as an order
+                // LEVEL, and on a time exit it is absent from the exit execution. Built once per
+                // run; defensive (empty on any API hiccup -> only stop exits get a level).
+                stops = BuildStopIndex(perf);
+
+                int cap = nTrades < 5000 ? nTrades : 5000;
+                for (int i = 0; i < cap; i++)
+                {
+                    Trade t = all[i];
+                    if (i > 0) sb.Append(",");
+                    string entry = (t.Entry != null) ? t.Entry.Time.ToString("o") : "";
+                    string exit  = (t.Exit  != null) ? t.Exit.Time.ToString("o")  : "";
+                    // Times are the NT chart wall-clock (ET per the runbook), tz-naive --
+                    // matching the original entryTime; the comparator attaches ET.
+                    sb.Append("{\"pnl\":").Append(Num(t.ProfitCurrency))
+                      .Append(",\"marketPosition\":").Append(JsonStr(SafeStr(delegate { return t.Entry.MarketPosition.ToString(); })))
+                      .Append(",\"entryTime\":").Append(JsonStr(entry))
+                      .Append(",\"exitTime\":").Append(JsonStr(exit))
+                      .Append(",\"entryPrice\":").Append(SafeNum(delegate { return t.Entry.Price; }))
+                      .Append(",\"exitPrice\":").Append(SafeNum(delegate { return t.Exit.Price; }))
+                      .Append(",\"exitName\":").Append(JsonStr(SafeStr(delegate { return t.Exit.Order.Name; })));
+                    double stp = ResolveStop(t, stops);
+                    if (!double.IsNaN(stp))
+                        sb.Append(",\"stopPrice\":").Append(Num(stp));
+                    sb.Append("}");
+                }
+            }
+            sb.Append("]");
+            // The stop orders the matching saw, and how many carried their history (Order.OrderUpdates):
+            // MatchStop reads Order.Time differently with and without it.
+            if (stops != null)
+                sb.Append(",\"stopOrders\":{\"count\":").Append(stops.Count).Append(",\"withHistory\":").Append(stops.WithHistory).Append("}");
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        // One stop order of the run as the matching needs it: plain data, no NinjaTrader types,
+        // so tools\Test-BacktestStops.ps1 compiles and runs MatchStop on its own.
+        // (Until 2026-10 the stops were keyed by calendar DAY - right for the one-trade-a-day event
+        // strategies it was written for, wrong for any other: every trade of a day got that day's
+        // first stop, a stop-market ENTRY counted as a stop, and the day's stop even overrode the
+        // price of the stop a trade actually exited on.)
+        // ! What Order.Time means depends on whether NinjaTrader kept the order's history. With history
+        //   (Order.OrderUpdates) it is the LAST change of state - for a stop that is gone, its cancel or
+        //   fill (NinjaTrader's help; Order.Update sets it) - and the first update is when it was placed.
+        //   A Strategy Analyzer order has NO history, and its Order.Time stays the time it was placed:
+        //   a YM backtest of 226 trades (2026-10-19) put every cancelled stop BEFORE its trade's exit,
+        //   and reading it as a cancel time handed 44 target exits the next trade's stop.
+        internal struct StopCandidate
+        {
+            public DateTime Placed;     // its first update with history, else Order.Time
+            public DateTime Ended;      // Order.Time with history: its cancel or fill. Unknown without (HasEnd false)
+            public bool HasEnd;         // NinjaTrader kept its history
+            public int Seq;             // equal times keep the order history's own order
+            public bool ExitSide;       // Sell / BuyToCover: a protective stop. Buy / SellShort: a stop-market ENTRY
+            public bool ForLong;        // Sell protects a long, BuyToCover a short
+            public string FromEntry;    // Order.FromEntrySignal ("" when unknown)
+            public string Oco;          // Order.Oco ("" when none)
+            public double StopPrice;
+        }
+
+        // The run's stop orders, indexed for MatchStop: those with history by Ended, those without by
+        // Placed, and every one by its OCO id. Pure, so the test builds it the same way.
+        internal sealed class StopIndex
+        {
+            public List<StopCandidate> ByEnd = new List<StopCandidate>();
+            public List<StopCandidate> ByPlaced = new List<StopCandidate>();
+            public Dictionary<string, List<StopCandidate>> ByOco = new Dictionary<string, List<StopCandidate>>();
+            public int Count;
+            public int WithHistory;
+
+            public static StopIndex Build(List<StopCandidate> all)
+            {
+                StopIndex x = new StopIndex();
+                foreach (StopCandidate c in all)
+                {
+                    x.Count++;
+                    if (c.HasEnd) { x.WithHistory++; x.ByEnd.Add(c); } else x.ByPlaced.Add(c);
+                    if (!string.IsNullOrEmpty(c.Oco))
+                    {
+                        List<StopCandidate> l;
+                        if (!x.ByOco.TryGetValue(c.Oco, out l)) { l = new List<StopCandidate>(); x.ByOco[c.Oco] = l; }
+                        l.Add(c);
+                    }
+                }
+                x.ByEnd.Sort(delegate(StopCandidate a, StopCandidate b) {
+                    int k = a.Ended.CompareTo(b.Ended);
+                    return k != 0 ? k : a.Seq.CompareTo(b.Seq);
+                });
+                x.ByPlaced.Sort(delegate(StopCandidate a, StopCandidate b) {
+                    int k = a.Placed.CompareTo(b.Placed);
+                    return k != 0 ? k : a.Seq.CompareTo(b.Seq);
+                });
+                return x;
+            }
+        }
+
+        // Every protective-stop candidate of the run (StopMarket / StopLimit; never the "Close position"
+        // order of a reversal). Defensive: an API hiccup degrades to fewer candidates (or none), never to
+        // a failed result.
+        private static StopIndex BuildStopIndex(SystemPerformance perf)
+        {
+            var list = new List<StopCandidate>();
+            try
+            {
+                IEnumerator<Order> orders = perf.GetBacktestOrdersReverse();   // newest first
+                if (orders != null)
+                {
+                    try
+                    {
+                        int n = 0;
+                        while (orders.MoveNext())
+                        {
+                            Order o = orders.Current;
+                            n++;
+                            try
+                            {
+                                if (o == null || (o.OrderType != OrderType.StopMarket && o.OrderType != OrderType.StopLimit)) continue;
+                                if (o.Name == "Close position") continue;
+                                double sp = o.StopPrice;
+                                if (double.IsNaN(sp) || sp <= 0) continue;
+                                StopCandidate c = new StopCandidate();
+                                DateTime first = DateTime.MinValue;
+                                try
+                                {
+                                    IList<OrderEventArgs> ups = o.OrderUpdates;
+                                    if (ups != null)
+                                        foreach (OrderEventArgs u in ups)
+                                            if (u != null && u.Time != DateTime.MinValue && (first == DateTime.MinValue || u.Time < first))
+                                                first = u.Time;
+                                }
+                                catch { }
+                                c.HasEnd = first != DateTime.MinValue;
+                                c.Placed = c.HasEnd ? first : o.Time;
+                                c.Ended = c.HasEnd ? o.Time : DateTime.MinValue;
+                                c.Seq = -n;
+                                c.ExitSide = o.OrderAction == OrderAction.Sell || o.OrderAction == OrderAction.BuyToCover;
+                                c.ForLong = o.OrderAction == OrderAction.Sell;
+                                c.FromEntry = o.FromEntrySignal ?? "";
+                                c.Oco = o.Oco ?? "";
+                                c.StopPrice = sp;
+                                list.Add(c);
+                            }
+                            catch { }
+                        }
+                    }
+                    finally { try { orders.Dispose(); } catch { } }
+                }
+            }
+            catch { }
+            return StopIndex.Build(list);
+        }
+
+        // A trade's stop level (the rules are MatchStop's); NaN when none is found, and the field is
+        // then omitted - the comparator sees it absent rather than wrong.
+        private static double ResolveStop(Trade t, StopIndex stops)
+        {
+            try
+            {
+                if (t.Entry == null || t.Exit == null) return double.NaN;
+                bool isLong = t.Entry.MarketPosition == MarketPosition.Long;
+                string signal = "";
+                try { if (t.Entry.Order != null && t.Entry.Order.Name != null) signal = t.Entry.Order.Name; } catch { }
+                bool exitWasStop = false;
+                double exitStop = double.NaN;
+                string exitOco = "";
+                try
+                {
+                    Order xo = t.Exit.Order;
+                    if (xo != null)
+                    {
+                        // A reversal's "Close position" stop is the NEW entry's trigger, not this trade's stop.
+                        exitWasStop = (xo.OrderType == OrderType.StopMarket || xo.OrderType == OrderType.StopLimit)
+                                      && (xo.OrderAction == OrderAction.Sell || xo.OrderAction == OrderAction.BuyToCover)
+                                      && xo.Name != "Close position";
+                        exitStop = xo.StopPrice;
+                        exitOco = xo.Oco ?? "";
+                    }
+                }
+                catch { }
+                return MatchStop(stops, t.Entry.Time, t.Exit.Time, isLong, signal, exitWasStop, exitStop, exitOco);
+            }
+            catch { return double.NaN; }
+        }
+
+        // The stop of one trade, from plain data (C# 5: the test compiles it with the .NET Framework csc).
+        // 1. It exited ON its stop: that order's price - the level that filled.
+        // 2. A target exit: its OCO partner, found by the OCO id (one per bracket), whatever the times say.
+        // 3. With history: the stop that was alive when it closed - the exit side of its direction (a
+        //    stop-market ENTRY never counts), from its entry signal when both name one, placed no later
+        //    than its exit (AT it only when the trade lasted no longer: a trade entered on the exit bar
+        //    places its own then), and ended - cancelled or filled - AT or AFTER its exit; the one that
+        //    ended FIRST (a trade's own stop goes when it closes; another trade's later). Equal ends
+        //    (scaled in under one signal): placed nearest the entry. Nothing alive at the exit: its own
+        //    stop cancelled shortly before (CancelOrder, then an exit on the next bar) - the last placed
+        //    during the trade.
+        // 4. Without history (a backtest): a stop placed during the trade - from its entry, before its
+        //    exit (AT it only for a trade that lasted no longer) - preferring one placed AT its entry
+        //    (each entry's stop goes in with its fill, so two entries scaled in under one signal keep
+        //    their own), else the latest. Without history a stop cancelled and placed again cannot be
+        //    told from a second one: the one placed at the entry wins.
+        // NaN when nothing matches. Scans are bounded, so a huge order history cannot stall the result.
+        internal static double MatchStop(StopIndex ix, DateTime entryTime, DateTime exitTime, bool isLong,
+                                         string entrySignal, bool exitWasStop, double exitStopPrice, string exitOco)
+        {
+            if (exitWasStop && !double.IsNaN(exitStopPrice) && exitStopPrice > 0) return exitStopPrice;
+            if (ix == null) return double.NaN;
+            const int scanLimit = 5000;
+            if (!string.IsNullOrEmpty(exitOco))
+            {
+                List<StopCandidate> partners;
+                if (ix.ByOco.TryGetValue(exitOco, out partners))
+                    foreach (StopCandidate c in partners)
+                        if (StopFits(c, entryTime, exitTime, isLong, entrySignal)) return c.StopPrice;
+            }
+
+            List<StopCandidate> byEnd = ix.ByEnd;
+            int lo = 0, hi = byEnd.Count;
+            while (lo < hi) { int mid = (lo + hi) / 2; if (byEnd[mid].Ended < exitTime) lo = mid + 1; else hi = mid; }
+            int best = -1;
+            for (int i = lo; i < byEnd.Count && i < lo + scanLimit; i++)
+            {
+                StopCandidate c = byEnd[i];
+                if (best >= 0 && c.Ended > byEnd[best].Ended) break;
+                if (!StopFits(c, entryTime, exitTime, isLong, entrySignal)) continue;
+                if (best < 0) { best = i; continue; }
+                if (Math.Abs((c.Placed - entryTime).Ticks) < Math.Abs((byEnd[best].Placed - entryTime).Ticks)) best = i;
+            }
+            if (best >= 0) return byEnd[best].StopPrice;
+            for (int i = lo - 1; i >= 0 && i >= lo - scanLimit && byEnd[i].Ended >= entryTime; i--)
+                if (byEnd[i].Placed >= entryTime && StopFits(byEnd[i], entryTime, exitTime, isLong, entrySignal))
+                    return byEnd[i].StopPrice;
+
+            List<StopCandidate> byPlaced = ix.ByPlaced;
+            lo = 0; hi = byPlaced.Count;
+            while (lo < hi) { int mid = (lo + hi) / 2; if (byPlaced[mid].Placed < entryTime) lo = mid + 1; else hi = mid; }
+            int atEntry = -1, latest = -1;
+            for (int i = lo; i < byPlaced.Count && i < lo + scanLimit && byPlaced[i].Placed <= exitTime; i++)
+            {
+                if (!StopFits(byPlaced[i], entryTime, exitTime, isLong, entrySignal)) continue;
+                if (byPlaced[i].Placed == entryTime) atEntry = i;
+                latest = i;
+            }
+            int pick = atEntry >= 0 ? atEntry : latest;
+            return pick >= 0 ? byPlaced[pick].StopPrice : double.NaN;
+        }
+
+        private static bool StopFits(StopCandidate c, DateTime entryTime, DateTime exitTime, bool isLong, string entrySignal)
+        {
+            if (!c.ExitSide || c.ForLong != isLong) return false;
+            if (!string.IsNullOrEmpty(c.FromEntry) && !string.IsNullOrEmpty(entrySignal) && c.FromEntry != entrySignal) return false;
+            if (c.Placed > exitTime) return false;                              // a later trade's stop
+            if (c.Placed == exitTime && entryTime < exitTime) return false;    // placed by a trade entered on the exit bar
+            return true;
+        }
+
+        private static string Num(double d)
+        {
+            if (double.IsNaN(d) || double.IsInfinity(d)) return "0";
+            return d.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private string BtErr(string id, string msg)
+        {
+            return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{\"message\":" + JsonStr(msg) + "}]}";
+        }
+
+        private string BuildResultJson(string id, object emit) { return BuildResultJson(id, emit, false); }
+
+        private string BuildResultJson(string id, object emit, bool assemblyReloaded)
+        {
+            bool success = true;
+            var errors = new List<string>();
+            if (emit != null)
+            {
+                Type t = emit.GetType();
+                PropertyInfo succ = t.GetProperty("Success");
+                if (succ != null) success = (bool)succ.GetValue(emit, null);
+
+                PropertyInfo diagProp = t.GetProperty("Diagnostics");
+                IEnumerable diags = diagProp != null ? diagProp.GetValue(emit, null) as IEnumerable : null;
+                if (diags != null)
+                {
+                    foreach (object d in diags)
+                    {
+                        Type dt = d.GetType();
+                        object sev = GetProp(dt, d, "Severity");
+                        if (sev == null || sev.ToString() != "Error") continue;
+
+                        string code = AsStr(GetProp(dt, d, "Id"));
+                        // Roslyn's Diagnostic.GetMessage takes an optional IFormatProvider,
+                        // so there is no zero-arg overload — find GetMessage with 0 or 1 param.
+                        string msg = "";
+                        foreach (MethodInfo mi in dt.GetMethods())
+                        {
+                            if (mi.Name != "GetMessage") continue;
+                            int np = mi.GetParameters().Length;
+                            if (np == 0) { msg = AsStr(mi.Invoke(d, null)); break; }
+                            if (np == 1) { msg = AsStr(mi.Invoke(d, new object[] { null })); break; }
+                        }
+
+                        string filePath = ""; int line = 0;
+                        object loc = GetProp(dt, d, "Location");
+                        if (loc != null)
+                        {
+                            MethodInfo span = loc.GetType().GetMethod("GetLineSpan", Type.EmptyTypes);
+                            object ls = span != null ? span.Invoke(loc, null) : null;
+                            if (ls != null)
+                            {
+                                filePath = AsStr(GetProp(ls.GetType(), ls, "Path"));
+                                object start = GetProp(ls.GetType(), ls, "StartLinePosition");
+                                if (start != null)
+                                {
+                                    object ln = GetProp(start.GetType(), start, "Line");
+                                    if (ln is int) line = (int)ln + 1; // Roslyn line is 0-based
+                                }
+                            }
+                        }
+                        errors.Add("{\"file\":" + JsonStr(filePath) + ",\"line\":" + line +
+                                   ",\"code\":" + JsonStr(code) + ",\"message\":" + JsonStr(msg) + "}");
+                    }
+                }
+            }
+            string status = (success && errors.Count == 0) ? "ok" : "error";
+            return "{\"id\":" + JsonStr(id) + ",\"status\":\"" + status + "\",\"errors\":[" +
+                   string.Join(",", errors.ToArray()) + "],\"assemblyReloaded\":" +
+                   ((assemblyReloaded && status == "ok") ? "true" : "false") + "}";
+        }
+
+        // --- Account state: independent, out-of-band read of NT8's own Account
+        // objects (open positions, working orders, realized/unrealized P&L, recent
+        // completed trades). This is a SEPARATE channel from whatever automation feeds
+        // your strategy: when an upstream position substream stalls (e.g. NT8 stops
+        // pushing updates and a winning trade is booked as a $0 placeholder),
+        // this still reads NT8's truth. Read-only — never submits/cancels/flattens.
+        // Every field access is wrapped so an API mismatch degrades to a null field
+        // rather than throwing; the whole body is guarded so a bad call returns a
+        // structured {status:"error"} instead of crashing the AddOn loop.
+        private string RunAccountState(string id, string accountFilter)
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.Append("{\"id\":").Append(JsonStr(id))
+                  .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"accounts\":[");
+
+                var accts = new List<Account>();
+                try { lock (Account.All) { foreach (Account a in Account.All) accts.Add(a); } } catch { }
+
+                bool firstAcct = true;
+                foreach (Account acct in accts)
+                {
+                    string name = SafeStr(delegate { return acct.Name; });
+                    if (!string.IsNullOrEmpty(accountFilter) && name != accountFilter) continue;
+                    if (!firstAcct) sb.Append(",");
+                    firstAcct = false;
+
+                    sb.Append("{\"name\":").Append(JsonStr(name));
+                    sb.Append(",\"realizedPnl\":").Append(AcctNum(acct, AccountItem.RealizedProfitLoss));
+                    sb.Append(",\"unrealizedPnl\":").Append(AcctNum(acct, AccountItem.UnrealizedProfitLoss));
+
+                    // open positions (only non-flat = live exposure)
+                    sb.Append(",\"positions\":[");
+                    var positions = new List<Position>();
+                    try { lock (acct.Positions) { foreach (Position p in acct.Positions) positions.Add(p); } } catch { }
+                    bool firstPos = true;
+                    foreach (Position p in positions)
+                    {
+                        string mp = SafeStr(delegate { return p.MarketPosition.ToString(); });
+                        if (mp == "Flat" || mp == "") continue;
+                        if (!firstPos) sb.Append(",");
+                        firstPos = false;
+                        sb.Append("{\"instrument\":").Append(JsonStr(SafeStr(delegate { return p.Instrument.FullName; })))
+                          .Append(",\"marketPosition\":").Append(JsonStr(mp))
+                          .Append(",\"quantity\":").Append(SafeInt(delegate { return p.Quantity; }).ToString(InvCi))
+                          .Append(",\"avgPrice\":").Append(SafeNum(delegate { return p.AveragePrice; }))
+                          .Append(",\"unrealizedPnl\":").Append(PosUnrealized(p))
+                          .Append("}");
+                    }
+                    sb.Append("]");
+
+                    // working orders (stops/targets/entries still live at NT8)
+                    sb.Append(",\"workingOrders\":[");
+                    var orders = new List<Order>();
+                    try { lock (acct.Orders) { foreach (Order o in acct.Orders) orders.Add(o); } } catch { }
+                    bool firstOrd = true;
+                    foreach (Order o in orders)
+                    {
+                        string st = SafeStr(delegate { return o.OrderState.ToString(); });
+                        if (!IsWorkingState(st)) continue;
+                        if (!firstOrd) sb.Append(",");
+                        firstOrd = false;
+                        sb.Append("{\"instrument\":").Append(JsonStr(SafeStr(delegate { return o.Instrument.FullName; })))
+                          .Append(",\"action\":").Append(JsonStr(SafeStr(delegate { return o.OrderAction.ToString(); })))
+                          .Append(",\"type\":").Append(JsonStr(SafeStr(delegate { return o.OrderType.ToString(); })))
+                          .Append(",\"quantity\":").Append(SafeInt(delegate { return o.Quantity; }).ToString(InvCi))
+                          .Append(",\"limitPrice\":").Append(SafeNum(delegate { return o.LimitPrice; }))
+                          .Append(",\"stopPrice\":").Append(SafeNum(delegate { return o.StopPrice; }))
+                          .Append(",\"name\":").Append(JsonStr(SafeStr(delegate { return o.Name; })))
+                          .Append(",\"state\":").Append(JsonStr(st))
+                          .Append("}");
+                    }
+                    sb.Append("]");
+
+                    // recent raw fills (entry + exit executions — the authoritative "what
+                    // actually filled"; account-level realizedPnl above is the session total).
+                    sb.Append(",\"recentExecutions\":[");
+                    var execs = new List<Execution>();
+                    try { lock (acct.Executions) { foreach (Execution e in acct.Executions) execs.Add(e); } } catch { }
+                    int from = execs.Count > RecentExecutionsMax ? execs.Count - RecentExecutionsMax : 0;
+                    bool firstEx = true;
+                    for (int xi = from; xi < execs.Count; xi++)
+                    {
+                        Execution e = execs[xi];
+                        if (!firstEx) sb.Append(",");
+                        firstEx = false;
+                        sb.Append("{\"instrument\":").Append(JsonStr(SafeStr(delegate { return e.Instrument.FullName; })))
+                          .Append(",\"marketPosition\":").Append(JsonStr(SafeStr(delegate { return e.MarketPosition.ToString(); })))
+                          .Append(",\"quantity\":").Append(SafeInt(delegate { return e.Quantity; }).ToString(InvCi))
+                          .Append(",\"price\":").Append(SafeNum(delegate { return e.Price; }))
+                          .Append(",\"time\":").Append(JsonStr(SafeStr(delegate { return e.Time.ToUniversalTime().ToString("o"); })))
+                          .Append(",\"commission\":").Append(SafeNum(delegate { return e.Commission; }))
+                          .Append(",\"orderName\":").Append(JsonStr(SafeStr(delegate { return e.Order.Name; })))
+                          .Append("}");
+                    }
+                    sb.Append("]}");
+                }
+                sb.Append("]}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"ts\":" +
+                       JsonStr(DateTime.UtcNow.ToString("o")) + ",\"accounts\":[],\"errors\":[{" +
+                       "\"code\":\"BRIDGE\",\"message\":" + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        // --- Force-close: flatten an account's position(s) and cancel its working
+        // orders. Automated strategies do not always reliably close a stranded/naked
+        // position; this is the independent kill switch the `watch` watchdog calls when it
+        // sees an unprotected position. Account name is REQUIRED (refuses to
+        // flatten everything). Acts AFTER releasing the snapshot locks — Lesson
+        // #159: never call Account.Cancel/Flatten while holding a collection lock.
+        private string RunFlatten(string id, string accountFilter, string instrumentFilter)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(accountFilter))
+                    return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"flattened\":[],\"errors\":[{" +
+                           "\"code\":\"BRIDGE\",\"message\":\"flatten requires an account name\"}]}";
+
+                Account acct = null;
+                try { lock (Account.All) { foreach (Account a in Account.All) { if (a.Name == accountFilter) { acct = a; break; } } } } catch { }
+                if (acct == null)
+                    return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"flattened\":[],\"errors\":[{" +
+                           "\"code\":\"BRIDGE\",\"message\":" + JsonStr("account not found: " + accountFilter) + "}]}";
+
+                var instrs = new List<Instrument>();
+                var flattened = new List<string>();
+                try {
+                    lock (acct.Positions) {
+                        foreach (Position p in acct.Positions) {
+                            string mp = SafeStr(delegate { return p.MarketPosition.ToString(); });
+                            if (mp == "Flat" || mp == "") continue;
+                            string fn = SafeStr(delegate { return p.Instrument.FullName; });
+                            if (!string.IsNullOrEmpty(instrumentFilter) && fn != instrumentFilter) continue;
+                            instrs.Add(p.Instrument);
+                            flattened.Add(fn + " " + mp + " qty=" + SafeInt(delegate { return p.Quantity; }).ToString(InvCi));
+                        }
+                    }
+                } catch { }
+
+                var ordersToCancel = new List<Order>();
+                try {
+                    lock (acct.Orders) {
+                        foreach (Order o in acct.Orders) {
+                            if (!IsWorkingState(SafeStr(delegate { return o.OrderState.ToString(); }))) continue;
+                            string fn = SafeStr(delegate { return o.Instrument.FullName; });
+                            if (!string.IsNullOrEmpty(instrumentFilter) && fn != instrumentFilter) continue;
+                            ordersToCancel.Add(o);
+                        }
+                    }
+                } catch { }
+
+                // act AFTER the locks are released (Lesson #159)
+                int cancelled = 0;
+                if (ordersToCancel.Count > 0) {
+                    try { acct.Cancel(ordersToCancel); cancelled = ordersToCancel.Count; }
+                    catch (Exception ex) { LogSafe("flatten cancel: " + ex.Message); }
+                }
+                bool flattenCalled = false;
+                if (instrs.Count > 0) {
+                    try { acct.Flatten(instrs); flattenCalled = true; }
+                    catch (Exception ex) { LogSafe("flatten: " + ex.Message); }
+                }
+                LogSafe("FLATTEN account=" + accountFilter + " instrument='" + instrumentFilter +
+                        "' positions=" + instrs.Count + " ordersCancelled=" + cancelled);
+
+                var sb = new StringBuilder();
+                sb.Append("{\"id\":").Append(JsonStr(id))
+                  .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"account\":").Append(JsonStr(accountFilter))
+                  .Append(",\"flattenCalled\":").Append(flattenCalled ? "true" : "false")
+                  .Append(",\"ordersCancelled\":").Append(cancelled.ToString(InvCi))
+                  .Append(",\"flattened\":[");
+                for (int i = 0; i < flattened.Count; i++) { if (i > 0) sb.Append(","); sb.Append(JsonStr(flattened[i])); }
+                sb.Append("]}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"flattened\":[],\"errors\":[{" +
+                       "\"code\":\"BRIDGE\",\"message\":" + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        // --- Account trade-performance: round-trip trades + headline metrics over a date
+        // range, sourced from NT8's own trade DB (Execution.DbGet) and paired by
+        // SystemPerformance.Calculate -- the engine behind the native Trade Performance
+        // window. Read-only. The DB query is start-padded so a round-trip opened just before
+        // `from` still pairs; metrics are computed over the EXIT-filtered set so the pad
+        // never pollutes them (see BuildPerfJson).
+        private const int PerfStartPadDays = 2;
+
+        private string RunPerformance(string id, string account, string fromStr, string toStr, string instrument)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(account))
+                    return PerfErr(id, "performance requires an account name");
+
+                Account acct = null;
+                try { lock (Account.All) { foreach (Account a in Account.All) { if (a.Name == account) { acct = a; break; } } } } catch { }
+                if (acct == null)
+                    return PerfErr(id, "account not found: " + account);
+
+                // ET date bounds. Default: today 00:00 -> now. An explicit `to` -> end-of-day.
+                DateTime now = DateTime.Now;   // NT8 process clock is exchange/ET per the runbook
+                DateTime from = ParsePerfDate(fromStr, new DateTime(now.Year, now.Month, now.Day, 0, 0, 0));
+                DateTime to = ParsePerfDate(toStr, now);
+                if (!string.IsNullOrEmpty(toStr)) to = to.Date.AddDays(1).AddSeconds(-1);
+                DateTime queryFrom = from.AddDays(-PerfStartPadDays);
+
+                var warnings = new List<string>();
+                string source = "db";
+                var execs = new List<Execution>();
+                var seen = new HashSet<string>();
+
+                // 1) DB executions over the padded window.
+                //    Execution.DbGet rejects bounds whose Kind is Local: NT8's DB time zone is
+                //    the exchange zone, not the machine's, so a Local DateTime trips an internal
+                //    TimeZoneInfo conversion ("...the source time zone must be TimeZoneInfo.Local").
+                //    When no --to is supplied, `to` defaults to DateTime.Now (Local) and DbGet
+                //    throws -> we silently lost the DB and fell back to the 3-day memory window
+                //    (every intraday/EOD pull omits --to). Pass Unspecified wall-clock bounds,
+                //    exactly as NT8's own Trade Performance window does. `queryFrom` is already
+                //    Unspecified (ParsePerfDate); normalize both for safety.
+                DateTime dbFrom = DateTime.SpecifyKind(queryFrom, DateTimeKind.Unspecified);
+                DateTime dbTo = DateTime.SpecifyKind(to, DateTimeKind.Unspecified);
+                try
+                {
+                    var dbExecs = Execution.DbGet(acct, dbFrom, dbTo);
+                    if (dbExecs != null)
+                        foreach (Execution e in dbExecs)
+                        {
+                            if (!ExecInScope(e, queryFrom, to, instrument)) continue;
+                            string k = SafeStr(delegate { return e.ExecutionId; });
+                            execs.Add(e);
+                            if (k.Length > 0) seen.Add(k);
+                        }
+                }
+                catch (Exception ex)
+                {
+                    LogSafe("perf DbGet: " + ex.Message);
+                    source = "memory";
+                    warnings.Add("DB history unavailable; limited to ~3-day in-memory window");
+                }
+
+                // 2) Union the in-memory executions (freshest intraday fills), deduped by id.
+                try
+                {
+                    lock (acct.Executions)
+                    {
+                        foreach (Execution e in acct.Executions)
+                        {
+                            if (!ExecInScope(e, queryFrom, to, instrument)) continue;
+                            string k = SafeStr(delegate { return e.ExecutionId; });
+                            if (k.Length > 0 && seen.Contains(k)) continue;
+                            execs.Add(e);
+                            if (k.Length > 0) seen.Add(k);
+                        }
+                    }
+                }
+                catch (Exception ex) { LogSafe("perf mem-union: " + ex.Message); }
+
+                // 2b) Commission is a curve-ball for live/funded accounts: the raw executions
+                //     from Execution.DbGet carry Commission==0 because NT8 NEVER persists the
+                //     per-fill commission -- the native Trade Performance window recomputes it at
+                //     display time by applying the account's assigned Commission TEMPLATE
+                //     (acct.Commission, a Cbi.Commission whose public GetWithMinimum(instrument,
+                //     quantity) yields the per-side charge). Pull the template + the server's
+                //     running commission/fee totals so BuildPerfJson can reconstruct per-trade
+                //     commission exactly as the window does (and cross-check against the server).
+                Commission commTemplate = null;
+                try { commTemplate = acct.Commission; } catch (Exception ex) { LogSafe("perf commTemplate: " + ex.Message); }
+                double svrComm = double.NaN, svrFee = double.NaN;
+                try { svrComm = acct.Get(AccountItem.Commission, acct.Denomination); } catch { }
+                try { svrFee = acct.Get(AccountItem.Fee, acct.Denomination); } catch { }
+
+                // 3) Pair round-trips + 4) emit (filtering trades to exit in [from,to]).
+                SystemPerformance perf = SystemPerformance.Calculate(execs);
+                return BuildPerfJson(id, perf, account, from, to, source, warnings, commTemplate, svrComm, svrFee);
+            }
+            catch (Exception ex)
+            {
+                return PerfErr(id, ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        // An execution is in scope if its time is within the (padded) window and it matches
+        // the optional instrument filter. Defensive: a read failure excludes it.
+        private static bool ExecInScope(Execution e, DateTime lo, DateTime hi, string instrument)
+        {
+            try
+            {
+                if (e == null) return false;
+                DateTime t = e.Time;
+                if (t < lo || t > hi) return false;
+                if (!string.IsNullOrEmpty(instrument)
+                    && SafeStr(delegate { return e.Instrument.FullName; }) != instrument) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static DateTime ParsePerfDate(string s, DateTime fallback)
+        {
+            if (string.IsNullOrEmpty(s)) return fallback;
+            DateTime d;
+            if (DateTime.TryParseExact(s, "yyyy-MM-dd", InvCi,
+                    System.Globalization.DateTimeStyles.None, out d)) return d;
+            if (DateTime.TryParse(s, InvCi, System.Globalization.DateTimeStyles.None, out d)) return d;
+            return fallback;
+        }
+
+        private static string PerfErr(string id, string message)
+        {
+            return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"ts\":" +
+                   JsonStr(DateTime.UtcNow.ToString("o")) +
+                   ",\"metrics\":{\"totalTrades\":0},\"trades\":[],\"warnings\":[],\"errors\":[{" +
+                   "\"code\":\"BRIDGE\",\"message\":" + JsonStr(message) + "}]}";
+        }
+
+        // Sibling of BuildBacktestJson (NOT a refactor): metrics are computed here from the
+        // EXIT-filtered trade set (pad-safe), and per-trade quantity/commission are added.
+        // The full scorecard (win rate, avg win/loss, equity, drawdown) is derived client-side
+        // by nt8bridge.report.compute_stats from `trades`, so we emit only headline metrics.
+        private string BuildPerfJson(string id, SystemPerformance perf, string account,
+                                     DateTime from, DateTime to, string source, List<string> warnings,
+                                     Commission commTemplate, double svrComm, double svrFee)
+        {
+            var trades = new List<Trade>();
+            TradeCollection all = (perf != null) ? perf.AllTrades : null;
+            if (all != null)
+            {
+                for (int i = 0; i < all.Count; i++)
+                {
+                    Trade t = all[i];
+                    if (t == null || t.Exit == null) continue;
+                    DateTime xt;
+                    try { xt = t.Exit.Time; } catch { continue; }
+                    if (xt >= from && xt <= to) trades.Add(t);
+                }
+            }
+
+            int n = trades.Count;
+            // Per-trade commission, resolved once so the metric total and the per-trade emission
+            // agree. Preference: (1) the execution's stored commission if the server already
+            // stamped it (fresh live fills carry it); (2) else reconstruct from the account's
+            // Commission TEMPLATE the same way the native window does -- entry-side + exit-side
+            // GetWithMinimum(instrument, legQty). Zero-commission accounts with no template stay 0.
+            double[] comm = new double[n];
+            double[] grossArr = new double[n];
+            int nStored = 0, nTemplate = 0, nNoComm = 0;
+            double net = 0, gp = 0, gl = 0, cum = 0, peak = 0, maxDd = 0, totalComm = 0;
+            for (int i = 0; i < n; i++)
+            {
+                Trade t = trades[i];
+                double pnl = 0; try { pnl = t.ProfitCurrency; } catch { }
+                net += pnl;
+                if (pnl > 0) gp += pnl; else if (pnl < 0) gl += pnl;
+                cum += pnl;
+                if (cum > peak) peak = cum;
+                double dd = cum - peak;
+                if (dd < maxDd) maxDd = dd;
+
+                double stored = 0; try { stored = t.Entry.Commission + t.Exit.Commission; } catch { }
+                double c = stored;
+                if (stored != 0) nStored++;
+                else if (commTemplate != null)
+                {
+                    try
+                    {
+                        c = commTemplate.GetWithMinimum(t.Entry.Instrument, t.Entry.Quantity)
+                          + commTemplate.GetWithMinimum(t.Exit.Instrument, t.Exit.Quantity);
+                    }
+                    catch { c = 0; }
+                    if (c != 0) nTemplate++; else nNoComm++;
+                }
+                else nNoComm++;
+                comm[i] = c;
+                totalComm += c;
+
+                // TRUE pre-commission gross per trade (v3.1.4, referee realignment):
+                // Trade.ProfitCurrency is net of commission stamped ON the fills, so add back
+                // exactly that — prorated per matched pair the same way the journal addon does
+                // (legComm × pairQty ÷ legFillQty; SystemPerformance emits one Trade per matched
+                // pair, and sibling pairs share legs). NOT comm[i]: that is stored-or-TEMPLATE
+                // and unprorated, and template commission never touches ProfitCurrency. Also
+                // distinct from metrics.grossProfit below, which is the sum of WINNERS.
+                double rawProrated = 0;
+                try
+                {
+                    double pairQty = t.Quantity;
+                    if (pairQty > 0)
+                    {
+                        double eq = t.Entry.Quantity, xq = t.Exit.Quantity;
+                        // Commission AND Fee (v3.1.5): ProfitCurrency is net of BOTH charges when
+                        // a provider stamps them on fills (proven on a remote prop capture: gross
+                        // short by exactly the fee total). Zero-charge fills are unchanged. Fee
+                        // via reflection (donor pattern) — reads 0 where the build lacks it.
+                        if (eq > 0) rawProrated += (t.Entry.Commission + ToD(GetPropAny(t.Entry, "Fee"))) * (pairQty / eq);
+                        if (xq > 0) rawProrated += (t.Exit.Commission + ToD(GetPropAny(t.Exit, "Fee"))) * (pairQty / xq);
+                    }
+                }
+                catch { }
+                grossArr[i] = pnl + rawProrated;
+            }
+            double pf = (gl < 0) ? (gp / (-gl)) : 0.0;
+            double netAfter = net - totalComm;
+            string commSource = (nStored > 0 && nTemplate > 0) ? "mixed"
+                              : (nStored > 0) ? "stored"
+                              : (nTemplate > 0) ? "template" : "none";
+            string templateName = SafeStr(delegate { return commTemplate != null ? commTemplate.Name : ""; });
+
+            var sb = new StringBuilder();
+            sb.Append("{\"id\":").Append(JsonStr(id)).Append(",\"status\":\"ok\",\"ts\":")
+              .Append(JsonStr(DateTime.UtcNow.ToString("o")))
+              .Append(",\"account\":").Append(JsonStr(account))
+              .Append(",\"source\":").Append(JsonStr(source))
+              .Append(",\"from\":").Append(JsonStr(from.ToString("o")))
+              .Append(",\"to\":").Append(JsonStr(to.ToString("o")))
+              .Append(",\"metrics\":{\"totalTrades\":").Append(n.ToString(InvCi))
+              .Append(",\"netProfit\":").Append(Num(net))
+              .Append(",\"grossProfit\":").Append(Num(gp))
+              .Append(",\"grossLoss\":").Append(Num(gl))
+              .Append(",\"profitFactor\":").Append(Num(pf))
+              .Append(",\"maxDrawdown\":").Append(Num(maxDd))
+              .Append(",\"commission\":").Append(Num(totalComm))
+              .Append(",\"netAfterCommission\":").Append(Num(netAfter))
+              .Append("},\"commissionInfo\":{\"template\":").Append(JsonStr(templateName))
+              .Append(",\"source\":").Append(JsonStr(commSource))
+              .Append(",\"total\":").Append(Num(totalComm))
+              .Append(",\"tradesFromStored\":").Append(nStored.ToString(InvCi))
+              .Append(",\"tradesFromTemplate\":").Append(nTemplate.ToString(InvCi))
+              .Append(",\"tradesNoCommission\":").Append(nNoComm.ToString(InvCi))
+              .Append(",\"serverCommissionTotal\":").Append(double.IsNaN(svrComm) ? "null" : Num(svrComm))
+              .Append(",\"serverFeeTotal\":").Append(double.IsNaN(svrFee) ? "null" : Num(svrFee))
+              .Append("},\"trades\":[");
+            int cap = n < 5000 ? n : 5000;
+            for (int i = 0; i < cap; i++)
+            {
+                Trade t = trades[i];
+                if (i > 0) sb.Append(",");
+                sb.Append("{\"pnl\":").Append(SafeNum(delegate { return t.ProfitCurrency; }))
+                  // grossProfit = pnl + prorated raw fill commission (see grossArr above) — the
+                  // uniform pre-commission basis the journal's grossPnl also carries (v3.1.4);
+                  // reconcile_verified.py's gross gate sums THIS, never pnl, so stored-comm
+                  // accounts (Sim fills stamped by an active template) reconcile exactly.
+                  .Append(",\"grossProfit\":").Append(Num(grossArr[i]))
+                  .Append(",\"marketPosition\":").Append(JsonStr(SafeStr(delegate { return t.Entry.MarketPosition.ToString(); })))
+                  .Append(",\"entryTime\":").Append(JsonStr(SafeStr(delegate { return t.Entry.Time.ToString("o"); })))
+                  .Append(",\"exitTime\":").Append(JsonStr(SafeStr(delegate { return t.Exit.Time.ToString("o"); })))
+                  .Append(",\"entryPrice\":").Append(SafeNum(delegate { return t.Entry.Price; }))
+                  .Append(",\"exitPrice\":").Append(SafeNum(delegate { return t.Exit.Price; }))
+                  .Append(",\"exitName\":").Append(JsonStr(SafeStr(delegate { return t.Exit.Order.Name; })))
+                  // quantity is the entry-leg value (exact for single-fill round-trips). commission
+                  // is stored-or-template-reconstructed (see loop above): entry-side + exit-side.
+                  .Append(",\"quantity\":").Append(SafeInt(delegate { return t.Entry.Quantity; }).ToString(InvCi))
+                  .Append(",\"commission\":").Append(Num(comm[i]))
+                  .Append("}");
+            }
+            sb.Append("],\"warnings\":[");
+            for (int i = 0; i < warnings.Count; i++) { if (i > 0) sb.Append(","); sb.Append(JsonStr(warnings[i])); }
+            sb.Append("],\"errors\":[]}");
+            return sb.ToString();
+        }
+
+        // ===== Read the OPEN Trade Performance window (perfwindow) =====
+        // The curve-ball: for live/funded (e.g. prop) accounts NT8 does NOT persist per-fill
+        // commission -- Execution.DbGet returns 0 and no local Commission template exists, so the
+        // `performance` verb above can only see gross P&L. But when NT8's native Trade Performance
+        // window DISPLAYS the account it fetches the broker's cash history
+        // (NinjaTrader.Cbi.TradingServices.CashHistoryLogItem: a CashChangeType + a Delta amount)
+        // and holds it in the tab's TradePerformanceReportViewModel: public TotalFeesAll/Long/Short
+        // plus FeesByExecution (execId -> cash-history items). This reads that live in-memory copy
+        // -- exactly what the window shows -- with no server round-trip of our own. Requires the
+        // window to be open on the account so its fees are calculated; read-only, on the window's
+        // OWN dispatcher thread (NT8 windows are per-thread -- see the chartseries lesson).
+        private string RunPerfWindow(string id, string account, bool generate, string fromStr, string toStr)
+        {
+            try
+            {
+                var wins = FindTradePerformanceWindows();
+                bool autoOpened = false;
+                if (wins.Count == 0)
+                {
+                    // A read needs an existing window. --generate is meant to be hands-off, so when none
+                    // is open we SPAWN one (NT8-native: construct the NTWindow on a pooled UI-thread
+                    // dispatcher + Show, wait for it to register in Globals.AllWindows), then drive it.
+                    // NOTE: the target account must be CONNECTED -- a fresh window's Generate pulls from
+                    // connected accounts and builds its account-filter list from those executions, so a
+                    // disconnected account never appears.
+                    if (!generate)
+                        return PerfWinErr(id, "no Trade Performance window open -- open a Trade Performance tab, "
+                            + "select account '" + account + "' + the date range, and let it display before running this "
+                            + "(or pass --generate to open + build it automatically)");
+                    string openErr = OpenTradePerformanceWindow(10000);
+                    if (openErr != null) return PerfWinErr(id, "auto-open failed: " + openErr);
+                    autoOpened = true;
+                    System.Threading.Thread.Sleep(1500);   // let the fresh window start populating
+                    wins = FindTradePerformanceWindows();
+                    if (wins.Count == 0) return PerfWinErr(id, "auto-opened a Trade Performance window but it did not register");
+                }
+
+                // Optionally DRIVE the window: set the account filter + date range and fire the
+                // report's own GenerateReport() (the Generate button's async method), then wait for
+                // it to finish -- so the pull is hands-off, no manual Generate click. A FRESH window
+                // (auto-opened) can need a couple of generates before the connected account's data +
+                // filter list are fully populated, so we loop generate+read until the account's data
+                // appears (or a bounded timeout).
+                List<string> frags;
+                if (generate)
+                {
+                    frags = new List<string>();
+                    int genWait = 0;
+                    while (true)
+                    {
+                        string genErr = DrivePerfGenerate(wins, account, fromStr, toStr, 180000);
+                        if (genErr != null && !autoOpened && genWait == 0)
+                            return PerfWinErr(id, genErr);   // an already-open window failing to generate is a hard error
+                        frags = CollectPerfReports(wins, account);
+                        if (frags.Count > 0) break;
+                        if (genWait >= 30000) break;         // give up after ~30s of empty re-generates
+                        System.Threading.Thread.Sleep(2000); genWait += 2000;
+                        wins = FindTradePerformanceWindows();
+                    }
+                }
+                else
+                {
+                    frags = CollectPerfReports(wins, account);
+                }
+                if (frags.Count == 0)
+                    return PerfWinErr(id, string.IsNullOrEmpty(account)
+                        ? "Trade Performance window(s) open but no report tab could be read"
+                        : "Trade Performance window(s) open but none is showing account '" + account + "' (check the account selector in the window)");
+
+                var sb = new StringBuilder();
+                sb.Append("{\"id\":").Append(JsonStr(id)).Append(",\"status\":\"ok\",\"ts\":")
+                  .Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"autoOpened\":").Append(autoOpened ? "true" : "false")
+                  .Append(",\"reportCount\":").Append(frags.Count.ToString(InvCi))
+                  .Append(",\"reports\":[");
+                for (int i = 0; i < frags.Count; i++) { if (i > 0) sb.Append(","); sb.Append(frags[i]); }
+                sb.Append("]}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return PerfWinErr(id, ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        // Standalone Trade Performance windows (NOT the Strategy Analyzer, whose embedded report
+        // runs in IsStrategyAnalyzerMode).
+        private List<Window> FindTradePerformanceWindows()
+        {
+            var wins = new List<Window>();
+            var all = Globals.AllWindows;
+            var snap = new List<Window>();
+            try { if (all != null) for (int i = 0; i < all.Count; i++) snap.Add(all[i]); } catch { }
+            foreach (Window w in snap)
+            {
+                if (w == null) continue;
+                string fn = null; try { fn = w.GetType().FullName; } catch { }
+                if (fn != null && fn.EndsWith(".TradePerformance.TradePerformance", StringComparison.Ordinal))
+                    wins.Add(w);
+            }
+            return wins;
+        }
+
+        // Spawn a Trade Performance window the NT8-native way: construct the NTWindow on one of NT8's
+        // pooled UI-thread dispatchers (Globals.RandomDispatcher -- a real STA UI thread with a running
+        // Dispatcher, where NT8's own windows live) and Show() it, then wait for it to register in
+        // Globals.AllWindows. Returns null on success, else an error string.
+        private string OpenTradePerformanceWindow(int timeoutMs)
+        {
+            try
+            {
+                Type t = Type.GetType("NinjaTrader.Gui.TradePerformance.TradePerformance, NinjaTrader.Gui");
+                if (t == null) return "TradePerformance window type not found";
+                System.Windows.Threading.Dispatcher disp = Globals.RandomDispatcher ?? Globals.MainThreadDispatcher;
+                if (disp == null) return "no NT8 UI dispatcher available";
+                disp.Invoke(new Action(delegate
+                {
+                    try
+                    {
+                        object w = Activator.CreateInstance(t);
+                        MethodInfo show = t.GetMethod("Show", Type.EmptyTypes);
+                        if (show != null) show.Invoke(w, null);
+                    }
+                    catch (Exception ex) { LogSafe("perfwindow open-inner: " + ex.Message); }
+                }));
+                int waited = 0;
+                while (FindTradePerformanceWindows().Count == 0 && waited < timeoutMs) { System.Threading.Thread.Sleep(100); waited += 100; }
+                return FindTradePerformanceWindows().Count > 0 ? null : "opened window did not appear in AllWindows within " + (timeoutMs / 1000) + "s";
+            }
+            catch (Exception ex) { return ex.GetType().Name + ": " + ex.Message; }
+        }
+
+        // Drive the window headless: on the first report tab that carries the target account, set the
+        // account filter (only it selected) + date range, fire the VM's public GenerateReport() (the
+        // async method behind the Generate button -- SAFE to invoke on the window's own thread, it
+        // awaits internally), then wait off-thread for its Task. Returns null on success, else an
+        // error string. The per-account breakdown isolates the account afterward regardless of how
+        // NT8 ends up applying the filter.
+        private string DrivePerfGenerate(List<Window> wins, string account, string fromStr, string toStr, int timeoutMs)
+        {
+            // Configure + fire on the first report tab, then wait for the Task. (The caller loops
+            // generate+read to give a fresh window time to populate connected-account data.)
+            object task = null;
+            foreach (Window w in wins)
+            {
+                try
+                {
+                    object t = w.Dispatcher.Invoke(new Func<object>(delegate { return ConfigureAndGenerate(w, account, fromStr, toStr); }));
+                    if (t != null) { task = t; break; }
+                }
+                catch (Exception ex) { LogSafe("perfwindow gen disp: " + ex.Message); }
+            }
+            if (task == null)
+                return "could not start Generate (no report tab found)";
+
+            var tsk = task as System.Threading.Tasks.Task;
+            if (tsk != null)
+            {
+                int waited = 0;
+                while (!tsk.IsCompleted && waited < timeoutMs) { System.Threading.Thread.Sleep(100); waited += 100; }
+                if (tsk.IsFaulted)
+                    return "Generate faulted: " + (tsk.Exception != null ? tsk.Exception.GetBaseException().Message : "unknown");
+                if (!tsk.IsCompleted)
+                    return "Generate timed out after " + (timeoutMs / 1000) + "s (server fetch may be slow / lookback capped)";
+                // let the async fee calculation settle before we read (best effort, bounded).
+                System.Threading.Thread.Sleep(500);
+            }
+            return null;
+        }
+
+        // Runs on the window's dispatcher. Finds the first report tab (matching `account` if given),
+        // sets its account selection + dates, and returns the Task from GenerateReport() (or null if
+        // no suitable tab). Never blocks on the async work -- returns the Task to the caller to await.
+        private object ConfigureAndGenerate(Window w, string account, string fromStr, string toStr)
+        {
+            try
+            {
+                object tabControl = GetFieldAny(w, "tabControl");
+                var items = GetPropAny(tabControl, "Items") as System.Collections.IEnumerable;
+                if (items == null) return null;
+                foreach (object item in items)
+                {
+                    object report = ResolvePerfReport(item);
+                    if (report == null) continue;
+                    object vm = GetFieldAny(report, "report");
+                    if (vm == null) continue;
+
+                    // A freshly auto-opened window loads its account list lazily; force it so the
+                    // target account can appear + be selected (idempotent, best-effort).
+                    try
+                    {
+                        MethodInfo la = report.GetType().GetMethod("LoadAccounts", BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (la != null && la.GetParameters().Length == 0) la.Invoke(report, null);
+                    }
+                    catch (Exception ex) { LogSafe("perfwindow loadaccts: " + ex.Message); }
+
+                    // Account filter: best-effort select ONLY the target (others off). Do NOT gate on
+                    // the account being present -- a fresh window's account list is empty until its
+                    // first Generate builds it from the pulled executions, so gating would deadlock.
+                    // We generate regardless (the default generate covers connected accounts); the
+                    // per-account breakdown isolates the target from whatever the report pulls.
+                    if (!string.IsNullOrEmpty(account))
+                    {
+                        var availEnum = GetPropAny(vm, "AvailableAccounts") as System.Collections.IEnumerable;
+                        if (availEnum != null)
+                            foreach (object filt in availEnum)
+                            {
+                                string fn = SafeStr(delegate { return (string)GetPropAny(filt, "Filter"); });
+                                if (string.IsNullOrEmpty(fn)) { object inst = GetPropAny(filt, "Instance"); fn = SafeStr(delegate { return (string)GetPropAny(inst, "Name"); }); }
+                                SetPropAny(filt, "IsSelected", fn == account);
+                            }
+                    }
+
+                    // Date range (optional): StartDate/EndDate carry the date, StartTime/EndTime the time.
+                    if (!string.IsNullOrEmpty(fromStr))
+                    {
+                        DateTime f = ParsePerfDate(fromStr, DateTime.MinValue);
+                        if (f != DateTime.MinValue) { SetPropAny(vm, "StartDate", f.Date); SetPropAny(vm, "StartTime", f.Date); }
+                    }
+                    if (!string.IsNullOrEmpty(toStr))
+                    {
+                        DateTime tt = ParsePerfDate(toStr, DateTime.MinValue);
+                        if (tt != DateTime.MinValue) { SetPropAny(vm, "EndDate", tt.Date); SetPropAny(vm, "EndTime", tt.Date.AddDays(1).AddMinutes(-1)); }
+                    }
+
+                    // Fire the no-arg GenerateReport() overload (there are also (entry) and (strategy,mode)).
+                    MethodInfo gen = null;
+                    for (Type ty = vm.GetType(); ty != null && gen == null; ty = ty.BaseType)
+                        gen = ty.GetMethod("GenerateReport", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+                    if (gen == null) return null;
+                    object task = gen.Invoke(vm, null);
+                    return task ?? (object)"started";
+                }
+            }
+            catch (Exception ex) { LogSafe("perfwindow configure: " + ex.Message); }
+            return null;
+        }
+
+        // Read every window's report tabs (each on its own dispatcher), collecting the JSON fragments.
+        private List<string> CollectPerfReports(List<Window> wins, string account)
+        {
+            var frags = new List<string>();
+            foreach (Window w in wins)
+            {
+                try
+                {
+                    var got = (List<string>)w.Dispatcher.Invoke(new Func<List<string>>(delegate { return ReadPerfReports(w, account); }));
+                    if (got != null) frags.AddRange(got);
+                }
+                catch (Exception ex) { LogSafe("perfwindow disp: " + ex.Message); }
+            }
+            return frags;
+        }
+
+        // Walk one Trade Performance window's tab control, reading every report tab that matches the
+        // account filter (empty = all). Runs on the window's own dispatcher thread.
+        private List<string> ReadPerfReports(Window w, string accountFilter)
+        {
+            var outp = new List<string>();
+            try
+            {
+                object tabControl = GetFieldAny(w, "tabControl");
+                var items = GetPropAny(tabControl, "Items") as System.Collections.IEnumerable;
+                if (items == null) return outp;
+                foreach (object item in items)
+                {
+                    object report = ResolvePerfReport(item);
+                    if (report == null) continue;
+                    string frag = ReadOnePerfReport(report, accountFilter);
+                    if (frag != null) outp.Add(frag);
+                }
+            }
+            catch (Exception ex) { LogSafe("perfwindow tabs: " + ex.Message); }
+            return outp;
+        }
+
+        // A tab item is (or wraps) a NinjaTrader.Gui.TradePerformance.TradePerformanceReport.
+        private static object ResolvePerfReport(object item)
+        {
+            if (item == null) return null;
+            string tn = null; try { tn = item.GetType().FullName; } catch { }
+            if (tn != null && tn.EndsWith(".TradePerformanceReport", StringComparison.Ordinal)) return item;
+            object content = GetPropAny(item, "Content");
+            if (content != null)
+            {
+                string cn = null; try { cn = content.GetType().FullName; } catch { }
+                if (cn != null && cn.EndsWith(".TradePerformanceReport", StringComparison.Ordinal)) return content;
+            }
+            return null;
+        }
+
+        // Pull commission/fees out of one report tab's view model. Returns null if the account
+        // filter does not match this tab.
+        private string ReadOnePerfReport(object report, string accountFilter)
+        {
+            try
+            {
+                object vm = GetFieldAny(report, "report");   // TradePerformanceReportViewModel
+                if (vm == null) return null;
+
+                // The report supports MULTI-account selection, so report.account is usually null;
+                // the real filter is the VM's AvailableAccounts (each a TradePerformanceFilter with
+                // Instance=Account, IsSelected, Filter=display name). Collect the selected ones and
+                // match --name against them (or against the single report.account when present).
+                object acct = GetFieldAny(report, "account");
+                string acctName = acct != null ? SafeStr(delegate { return (string)GetPropAny(acct, "Name"); }) : "";
+                var selAccts = new List<string>();
+                object avail = GetPropAny(vm, "AvailableAccounts");
+                var availEnum = avail as System.Collections.IEnumerable;
+                if (availEnum != null)
+                    foreach (object filt in availEnum)
+                    {
+                        bool sel = false; try { object b = GetPropAny(filt, "IsSelected"); sel = b is bool && (bool)b; } catch { }
+                        if (!sel) continue;
+                        string fn = SafeStr(delegate { return (string)GetPropAny(filt, "Filter"); });
+                        if (string.IsNullOrEmpty(fn))
+                        {
+                            object inst = GetPropAny(filt, "Instance");
+                            fn = SafeStr(delegate { return (string)GetPropAny(inst, "Name"); });
+                        }
+                        if (!string.IsNullOrEmpty(fn)) selAccts.Add(fn);
+                    }
+                // NOTE: we do NOT reject the tab here on the selected-accounts list. A requested
+                // account may hold data in a tab without being "selected" (esp. a freshly auto-opened
+                // window). We compute the per-account accumulators below and, for an account request,
+                // skip the tab only if it truly has no data for that account (see the override block).
+
+                bool feesCalc = false; try { object b = GetPropAny(vm, "areFeesCalculated") ?? GetFieldAny(vm, "areFeesCalculated"); feesCalc = b is bool && (bool)b; } catch { }
+                object totalAllObj = GetPropAny(vm, "TotalFeesAll");
+                double totalAll = ToD(totalAllObj);
+                // Partial-rename guard: areFeesCalculated said fees ARE calculated, but TotalFeesAll did
+                // not resolve (member renamed on this NT8 build). Do NOT present the resulting 0 as a real
+                // total -- flip the trust flag off and attach a note so `feesCalculated` stays reliable.
+                string feeReadNote = null;
+                if (feesCalc && totalAllObj == null) { feesCalc = false; feeReadNote = "TotalFeesAll unreadable (NT8 build mismatch?)"; }
+                double totalLong = ToD(GetPropAny(vm, "TotalFeesLong"));
+                double totalShort = ToD(GetPropAny(vm, "TotalFeesShort"));
+                string from = FmtRange(GetFieldAny(vm, "sDate"), GetFieldAny(vm, "sTime"));
+                string to = FmtRange(GetFieldAny(vm, "eDate"), GetFieldAny(vm, "eTime"));
+
+                // Per-category breakdown from FeesByExecution: group the cash-history items by their
+                // CashChangeType (e.g. "Commission", "Exchange Fee", ...) and sum the Delta.
+                var byType = new Dictionary<string, double>();
+                var byCnt = new Dictionary<string, int>();
+                int execsWithFees = 0, itemCount = 0;
+                double sumDelta = 0;
+                object fbx = GetPropAny(vm, "FeesByExecution");
+                var dict = fbx as System.Collections.IDictionary;
+                if (dict != null)
+                {
+                    foreach (System.Collections.DictionaryEntry de in dict)
+                    {
+                        var list = de.Value as System.Collections.IEnumerable;
+                        if (list == null) continue;
+                        bool any = false;
+                        foreach (object it in list)
+                        {
+                            any = true; itemCount++;
+                            string ct = SafeStr(delegate { return (string)GetPropAny(it, "CashChangeType"); });
+                            if (string.IsNullOrEmpty(ct)) ct = "(unknown)";
+                            double delta = ToD(GetPropAny(it, "Delta"));
+                            if (!byType.ContainsKey(ct)) { byType[ct] = 0; byCnt[ct] = 0; }
+                            byType[ct] += delta; byCnt[ct] += 1; sumDelta += delta;
+                        }
+                        if (any) execsWithFees++;
+                    }
+                }
+
+                // PnL off the window's own SystemPerformance.AllTrades: overall net/gross plus a
+                // per-account split (Trade.Entry.Account.Name) so a single prop account is isolated.
+                int nTrades = -1;
+                double net = 0, gp = 0, gl = 0;
+                var acctNet = new Dictionary<string, double>();
+                var acctGp = new Dictionary<string, double>();
+                var acctGl = new Dictionary<string, double>();
+                var acctTr = new Dictionary<string, int>();
+                try
+                {
+                    object perf = GetFieldAny(vm, "performance");
+                    object at = GetPropAny(perf, "AllTrades");
+                    var te = at as System.Collections.IEnumerable;
+                    if (te != null)
+                    {
+                        nTrades = 0;
+                        foreach (object t in te)
+                        {
+                            nTrades++;
+                            double pnl = ToD(GetPropAny(t, "ProfitCurrency"));
+                            net += pnl; if (pnl > 0) gp += pnl; else if (pnl < 0) gl += pnl;
+                            string an = SafeStr(delegate { object en = GetPropAny(t, "Entry"); object a = GetPropAny(en, "Account"); return (string)GetPropAny(a, "Name"); });
+                            if (string.IsNullOrEmpty(an)) an = "(unknown)";
+                            if (!acctNet.ContainsKey(an)) { acctNet[an] = 0; acctGp[an] = 0; acctGl[an] = 0; acctTr[an] = 0; }
+                            acctNet[an] += pnl; acctTr[an] += 1;
+                            if (pnl > 0) acctGp[an] += pnl; else if (pnl < 0) acctGl[an] += pnl;
+                        }
+                    }
+                }
+                catch (Exception ex) { LogSafe("perfwindow trades: " + ex.Message); }
+
+                // Displayed executions carry commission/fee on Execution.Commission/.Fee. Sum overall +
+                // per account, and map executionId -> account so the server cash-history fees
+                // (FeesByExecution, the "Total Fees" path) can be attributed per account too.
+                int execCount = 0; double execComm = 0, execFee = 0;
+                var acctCnt = new Dictionary<string, int>();
+                var acctComm = new Dictionary<string, double>();
+                var acctFee = new Dictionary<string, double>();
+                var execAcct = new Dictionary<long, string>();
+                object execs = GetFieldAny(vm, "executions");
+                var execEnum = execs as System.Collections.IEnumerable;
+                if (execEnum != null)
+                    foreach (object e in execEnum)
+                    {
+                        execCount++;
+                        double ec = ToD(GetPropAny(e, "Commission"));
+                        double ef = ToD(GetPropAny(e, "Fee"));
+                        execComm += ec; execFee += ef;
+                        string an = SafeStr(delegate { object a = GetPropAny(e, "Account"); return (string)GetPropAny(a, "Name"); });
+                        if (string.IsNullOrEmpty(an)) an = "(unknown)";
+                        if (!acctCnt.ContainsKey(an)) { acctCnt[an] = 0; acctComm[an] = 0; acctFee[an] = 0; }
+                        acctCnt[an] += 1; acctComm[an] += ec; acctFee[an] += ef;
+                        try { object ido = GetPropAny(e, "Id"); if (ido != null) execAcct[Convert.ToInt64(ido)] = an; } catch { }
+                    }
+
+                // Server cash-history fees (the "Total Fees" line) attributed per account via executionId.
+                var acctCash = new Dictionary<string, double>();
+                if (dict != null)
+                    foreach (System.Collections.DictionaryEntry de in dict)
+                    {
+                        long eid; try { eid = Convert.ToInt64(de.Key); } catch { continue; }
+                        string an = execAcct.ContainsKey(eid) ? execAcct[eid] : "(unknown)";
+                        var list = de.Value as System.Collections.IEnumerable;
+                        if (list == null) continue;
+                        foreach (object it in list)
+                        {
+                            if (!acctCash.ContainsKey(an)) acctCash[an] = 0;
+                            acctCash[an] += ToD(GetPropAny(it, "Delta"));
+                        }
+                    }
+
+                // The window won't actually RESTRICT the report to the ticked account (NT8 leaves the
+                // account filter effectively off), so the raw totals are the all-accounts aggregate.
+                // When a single account is requested, override the headline with THAT account's own
+                // slice so `perfwindow --name X` reports X's numbers; accountBreakdown still lists all.
+                string scope = "allDisplayed";
+                if (!string.IsNullOrEmpty(accountFilter))
+                {
+                    // this tab holds no data for the requested account -> not the right tab.
+                    if (!acctNet.ContainsKey(accountFilter) && !acctCnt.ContainsKey(accountFilter)) return null;
+                    scope = "account";
+                    net = acctNet.ContainsKey(accountFilter) ? acctNet[accountFilter] : 0;
+                    gp = acctGp.ContainsKey(accountFilter) ? acctGp[accountFilter] : 0;
+                    gl = acctGl.ContainsKey(accountFilter) ? acctGl[accountFilter] : 0;
+                    nTrades = acctTr.ContainsKey(accountFilter) ? acctTr[accountFilter] : 0;
+                    execCount = acctCnt.ContainsKey(accountFilter) ? acctCnt[accountFilter] : 0;
+                    execComm = acctComm.ContainsKey(accountFilter) ? acctComm[accountFilter] : 0;
+                    execFee = acctFee.ContainsKey(accountFilter) ? acctFee[accountFilter] : 0;
+                }
+
+                // Report only what NT8/the broker actually SHOW: netProfit (NT8 "Total net profit" =
+                // the Tradovate Current-Balance change -- PRE-cost) + the separately-listed commission
+                // and fees as their own lines. No derived net-of-cost figure (the broker balance does
+                // not subtract these; no NT8 screen shows the subtraction). Commission rides on
+                // Execution.Commission; fees via server cash-history (acctCash) or Execution.Fee.
+                double headFee = string.IsNullOrEmpty(accountFilter)
+                    ? (totalAll != 0 ? totalAll : execFee)
+                    : (acctCash.ContainsKey(accountFilter) && acctCash[accountFilter] != 0 ? acctCash[accountFilter] : execFee);
+                double feesCost = Math.Abs(headFee);
+                double commCost = Math.Abs(execComm);
+
+                var sb = new StringBuilder();
+                sb.Append("{\"account\":").Append(JsonStr(acctName))
+                  .Append(",\"selectedAccounts\":[");
+                for (int i = 0; i < selAccts.Count; i++) { if (i > 0) sb.Append(","); sb.Append(JsonStr(selAccts[i])); }
+                sb.Append("]")
+                  .Append(",\"scope\":").Append(JsonStr(scope))
+                  .Append(",\"from\":").Append(JsonStr(from))
+                  .Append(",\"to\":").Append(JsonStr(to))
+                  .Append(",\"feesCalculated\":").Append(feesCalc ? "true" : "false")
+                  .Append(",\"feeReadNote\":").Append(feeReadNote == null ? "null" : JsonStr(feeReadNote))
+                  .Append(",\"totalFees\":").Append(Num(totalAll))
+                  .Append(",\"totalFeesLong\":").Append(Num(totalLong))
+                  .Append(",\"totalFeesShort\":").Append(Num(totalShort))
+                  .Append(",\"feeItemSum\":").Append(Num(sumDelta))
+                  .Append(",\"executionsWithFees\":").Append(execsWithFees.ToString(InvCi))
+                  .Append(",\"feeItemCount\":").Append(itemCount.ToString(InvCi))
+                  .Append(",\"executionCount\":").Append(execCount.ToString(InvCi))
+                  .Append(",\"execCommissionSum\":").Append(Num(execComm))
+                  .Append(",\"execFeeSum\":").Append(Num(execFee))
+                  .Append(",\"trades\":").Append(nTrades < 0 ? "null" : nTrades.ToString(InvCi))
+                  .Append(",\"netProfit\":").Append(Num(net))
+                  .Append(",\"grossProfit\":").Append(Num(gp))
+                  .Append(",\"grossLoss\":").Append(Num(gl))
+                  .Append(",\"commission\":").Append(Num(commCost))
+                  .Append(",\"fees\":").Append(Num(feesCost))
+                  .Append(",\"feeCategories\":[");
+                bool first = true;
+                foreach (var kv in byType)
+                {
+                    if (!first) sb.Append(","); first = false;
+                    sb.Append("{\"type\":").Append(JsonStr(kv.Key))
+                      .Append(",\"total\":").Append(Num(kv.Value))
+                      .Append(",\"count\":").Append(byCnt[kv.Key].ToString(InvCi))
+                      .Append("}");
+                }
+                sb.Append("],\"accountBreakdown\":[");
+                // Union of accounts seen in executions and in trades (usually identical).
+                var names = new List<string>();
+                foreach (var k in acctCnt.Keys) if (!names.Contains(k)) names.Add(k);
+                foreach (var k in acctNet.Keys) if (!names.Contains(k)) names.Add(k);
+                first = true;
+                foreach (string name in names)
+                {
+                    if (!first) sb.Append(","); first = false;
+                    int ex = acctCnt.ContainsKey(name) ? acctCnt[name] : 0;
+                    double cm = acctComm.ContainsKey(name) ? acctComm[name] : 0;
+                    // prefer the server cash-history fee (the "Total Fees" line) attributed to this
+                    // account; fall back to the execution-level Fee.
+                    double fe = (acctCash.ContainsKey(name) && acctCash[name] != 0) ? acctCash[name]
+                              : (acctFee.ContainsKey(name) ? acctFee[name] : 0);
+                    double pn = acctNet.ContainsKey(name) ? acctNet[name] : 0;
+                    int tr = acctTr.ContainsKey(name) ? acctTr[name] : 0;
+                    sb.Append("{\"account\":").Append(JsonStr(name))
+                      .Append(",\"trades\":").Append(tr.ToString(InvCi))
+                      .Append(",\"executions\":").Append(ex.ToString(InvCi))
+                      .Append(",\"netProfit\":").Append(Num(pn))
+                      .Append(",\"commission\":").Append(Num(Math.Abs(cm)))
+                      .Append(",\"fee\":").Append(Num(Math.Abs(fe)))
+                      .Append("}");
+                }
+                sb.Append("]}");
+                return sb.ToString();
+            }
+            catch (Exception ex) { LogSafe("perfwindow report: " + ex.Message); return null; }
+        }
+
+        private static double ToD(object o)
+        {
+            if (o == null) return 0;
+            try { return Convert.ToDouble(o, InvCi); } catch { return 0; }
+        }
+
+        // Combine a date-part + time-part DateTime (the VM stores them split) into an ISO string.
+        private static string FmtRange(object datePart, object timePart)
+        {
+            try
+            {
+                if (!(datePart is DateTime)) return "";
+                DateTime d = (DateTime)datePart;
+                if (timePart is DateTime) d = d.Date + ((DateTime)timePart).TimeOfDay;
+                return d.ToString("o");
+            }
+            catch { return ""; }
+        }
+
+        // Reflection helpers that walk the base-type chain and read public+non-public members
+        // (the VM/report expose some data as private fields, some as public props).
+        private static object GetFieldAny(object o, string name)
+        {
+            if (o == null) return null;
+            try
+            {
+                for (Type ty = o.GetType(); ty != null; ty = ty.BaseType)
+                {
+                    FieldInfo f = ty.GetField(name, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                    if (f != null) return f.GetValue(o);
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static object GetPropAny(object o, string name)
+        {
+            if (o == null) return null;
+            try
+            {
+                for (Type ty = o.GetType(); ty != null; ty = ty.BaseType)
+                {
+                    PropertyInfo p = ty.GetProperty(name, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                    if (p != null && p.CanRead) return p.GetValue(o, null);
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static void SetPropAny(object o, string name, object val)
+        {
+            if (o == null) return;
+            try
+            {
+                for (Type ty = o.GetType(); ty != null; ty = ty.BaseType)
+                {
+                    PropertyInfo p = ty.GetProperty(name, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                    if (p != null && p.CanWrite) { p.SetValue(o, val, null); return; }
+                }
+            }
+            catch { }
+        }
+
+        private string PerfWinErr(string id, string message)
+        {
+            return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"ts\":" +
+                   JsonStr(DateTime.UtcNow.ToString("o")) +
+                   ",\"reportCount\":0,\"reports\":[],\"errors\":[{" +
+                   "\"code\":\"BRIDGE\",\"message\":" + JsonStr(message) + "}]}";
+        }
+
+        // ConnectionStatusUpdate handler (named so Terminated can unsubscribe — no leak).
+        // Records, per connection name, WHY it last left Connected: "inadvertent"
+        // (ConnectionLost or an error-disconnect — eligible for auto-reconnect), "user"
+        // (clean Disconnect or UserAbort — parked, NEVER auto-reconnected), or "connected"
+        // (recovered). Fires on arbitrary NT8 threads -> only touches the
+        // ConcurrentDictionary + logs; never blocks.
+        private void OnConnStatus(object sender, ConnectionStatusEventArgs e)
+        {
+            try
+            {
+                if (e == null || e.Connection == null || e.Connection.Options == null) return;
+                string name = e.Connection.Options.Name;
+                if (string.IsNullOrEmpty(name)) return;
+                ConnectionStatus s = e.Status;
+                if (s == ConnectionStatus.Connected)
+                    _dropClass[name] = "connected";
+                else if (s == ConnectionStatus.ConnectionLost)
+                    _dropClass[name] = "inadvertent";
+                else if (s == ConnectionStatus.Disconnected)
+                    _dropClass[name] = (e.Error == ErrorCode.NoError || e.Error == ErrorCode.UserAbort) ? "user" : "inadvertent";
+                // Connecting / Disconnecting: transient — leave the prior classification.
+                LogSafe("conn status: " + name + " -> " + s + " (err=" + e.Error + ")");
+            }
+            catch (Exception ex) { LogSafe("OnConnStatus: " + ex.Message); }
+        }
+
+        // Read every configured connection's live status + whether it dropped
+        // INADVERTENTLY (drop class "inadvertent" and not currently connected). The Python
+        // guardian keys on inadvertentlyDropped; a connection the user parked reads false.
+        private string RunConnections(string id)
+        {
+            try
+            {
+                var live = new List<Connection>();
+                try { lock (Connection.Connections) { foreach (Connection c in Connection.Connections) live.Add(c); } } catch { }
+                var cfg = new List<ConnectOptions>();
+                try { lock (Globals.ConnectOptions) { foreach (ConnectOptions o in Globals.ConnectOptions) cfg.Add(o); } } catch { }
+
+                var sb = new StringBuilder();
+                sb.Append("{\"id\":").Append(JsonStr(id))
+                  .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"connections\":[");
+                // ⚠ A CONNECTED CONNECTION MUST NEVER BE MISSING FROM THIS REPORT.
+                //
+                // The loop below walks the CONFIGURATION and looks the live status up by
+                // name. A connection that is live but has no ConnectOptions entry under
+                // that name therefore did not appear at all - and the report is used to
+                // answer "is anything else connected?", where a missing row reads as
+                // "no". Measured 2026-08-20: NinjaTrader's connection menu listed 8
+                // entries with "Live" connected; this report listed 6 without it, and a
+                // reader concluded from it that nothing was connected.
+                //
+                // Fix: after the configured rows, append every LIVE connection whose
+                // name was not already emitted. `source` says where a row came from, so
+                // a caller can tell a configured entry from one only NinjaTrader knows.
+                var emitted = new List<string>();
+                bool first = true;
+                foreach (ConnectOptions o in cfg)
+                {
+                    string nm = SafeStr(delegate { return o.Name; });
+                    string liveStatus = LiveStatusOf(live, nm);
+                    bool connected = liveStatus == "Connected";
+                    string cls; if (!_dropClass.TryGetValue(nm, out cls)) cls = "";
+                    bool inadvertent = cls == "inadvertent" && !connected;
+                    emitted.Add(nm);
+                    if (!first) sb.Append(",");
+                    first = false;
+                    sb.Append("{\"name\":").Append(JsonStr(nm))
+                      .Append(",\"status\":").Append(JsonStr(liveStatus))
+                      .Append(",\"connected\":").Append(connected ? "true" : "false")
+                      .Append(",\"inadvertentlyDropped\":").Append(inadvertent ? "true" : "false")
+                      .Append(",\"source\":\"configured\"")
+                      .Append("}");
+                }
+                foreach (Connection c in live)
+                {
+                    string nm = SafeStr(delegate { return c.Options == null ? "" : c.Options.Name; });
+                    if (nm.Length == 0 || emitted.Contains(nm)) continue;
+                    emitted.Add(nm);
+                    string liveStatus = SafeStr(delegate { return c.Status.ToString(); });
+                    bool connected = liveStatus == "Connected";
+                    if (!first) sb.Append(",");
+                    first = false;
+                    sb.Append("{\"name\":").Append(JsonStr(nm))
+                      .Append(",\"status\":").Append(JsonStr(liveStatus))
+                      .Append(",\"connected\":").Append(connected ? "true" : "false")
+                      .Append(",\"inadvertentlyDropped\":false")
+                      .Append(",\"source\":\"live-only\"")
+                      .Append("}");
+                }
+                sb.Append("]}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"connections\":[],\"errors\":[{" +
+                       "\"code\":\"BRIDGE\",\"message\":" + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        // --- Feed health: per-instrument last-tick AGE, so a FROZEN-but-connected feed
+        // (NT8 reports the connection up while no ticks flow) is detectable. connwatch only
+        // heals NT8-flagged DROPS; a dark feed never flags a drop (a chart can freeze
+        // mid-session while the live market keeps moving, and the connections read still
+        // calls it connected the whole time). Age is computed HERE from a
+        // single clock (Now - MarketData.Last.Time) so there is no client/server skew or tz
+        // drift. Read-only; every access guarded so a bad instrument degrades to null fields.
+        private string RunFeedHealth(string id, string instrumentsCsv)
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.Append("{\"id\":").Append(JsonStr(id))
+                  .Append(",\"status\":\"ok\",\"ts\":").Append(JsonStr(DateTime.UtcNow.ToString("o")))
+                  .Append(",\"feeds\":[");
+                string[] names = (instrumentsCsv ?? "").Split(',');
+                bool first = true;
+                foreach (string rawName in names)
+                {
+                    string name = rawName == null ? "" : rawName.Trim();
+                    if (name.Length == 0) continue;
+                    if (!first) sb.Append(",");
+                    first = false;
+                    sb.Append("{\"instrument\":").Append(JsonStr(name));
+                    try
+                    {
+                        Instrument instr = Instrument.GetInstrument(name);
+                        bool haveLast = instr != null && instr.MarketData != null && instr.MarketData.Last != null;
+                        if (haveLast)
+                        {
+                            var last = instr.MarketData.Last;
+                            DateTime t = last.Time;
+                            double ageMs = (DateTime.Now - t).TotalMilliseconds;
+                            if (ageMs < 0) ageMs = 0;   // a future-stamped tick reads as fresh, not negative
+                            sb.Append(",\"lastPrice\":").Append(Num(last.Price))
+                              .Append(",\"lastTickTime\":").Append(JsonStr(t.ToUniversalTime().ToString("o")))
+                              .Append(",\"ageMs\":").Append(((long)ageMs).ToString(InvCi));
+                        }
+                        else
+                        {
+                            sb.Append(",\"lastPrice\":null,\"lastTickTime\":\"\",\"ageMs\":null");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogSafe("feedhealth '" + name + "': " + ex.Message);
+                        sb.Append(",\"lastPrice\":null,\"lastTickTime\":\"\",\"ageMs\":null");
+                    }
+                    sb.Append("}");
+                }
+                sb.Append("]}");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"ts\":" +
+                       JsonStr(DateTime.UtcNow.ToString("o")) + ",\"feeds\":[],\"errors\":[{" +
+                       "\"code\":\"BRIDGE\",\"message\":" + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        // Reconnect a configured connection by name via Connection.Connect(savedOptions),
+        // marshalled to the UI dispatcher (the spike-proven safe path). UNCONDITIONAL —
+        // an explicit reconnect is an operator override; the inadvertent-only POLICY lives
+        // in the Python guardian, not here. No-op (reports wasConnected) if already up.
+        private string RunReconnect(string id, string nameArg)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(nameArg))
+                    return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{" +
+                           "\"code\":\"BRIDGE\",\"message\":\"reconnect requires a connection name\"}]}";
+
+                var live = new List<Connection>();
+                try { lock (Connection.Connections) { foreach (Connection c in Connection.Connections) live.Add(c); } } catch { }
+                bool wasConnected = LiveStatusOf(live, nameArg) == "Connected";
+
+                ConnectOptions opt = null;
+                var cfg = new List<ConnectOptions>();
+                try { lock (Globals.ConnectOptions) { foreach (ConnectOptions o in Globals.ConnectOptions) cfg.Add(o); } } catch { }
+                foreach (ConnectOptions o in cfg)
+                    if (SafeStr(delegate { return o.Name; }) == nameArg) { opt = o; break; }
+                if (opt == null)
+                    return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{" +
+                           "\"code\":\"BRIDGE\",\"message\":" + JsonStr("connection not configured: " + nameArg) + "}]}";
+
+                bool attempted = false, threw = false, timedOut = false; string err = "";
+                if (!wasConnected)
+                {
+                    Exception cap = null;
+                    bool ran = false;
+                    ConnectOptions o2 = opt;
+                    Action act = delegate { ran = true; try { Connection.Connect(o2); } catch (Exception ex) { cap = ex; } };
+                    // Bounded UI marshal (MED-2): if the UI dispatcher is wedged, Invoke returns after
+                    // the timeout instead of blocking the bridge poller thread — which holds _gate —
+                    // indefinitely and starving every other command, including the flatten kill-switch.
+                    // A truly hung UI thread is then caught separately by the heartbeat watchdog
+                    // (TryBeat stops rewriting heartbeat.json -> stale mtime -> `nt8bridge watchdog`).
+                    try
+                    {
+                        var disp = Globals.MainThreadDispatcher;
+                        if (disp != null)
+                            disp.Invoke(System.Windows.Threading.DispatcherPriority.Send, TimeSpan.FromSeconds(10), act);
+                        else
+                            act();
+                    }
+                    catch (Exception ex) { cap = ex; }
+                    timedOut = !ran && cap == null;
+                    attempted = true; threw = cap != null;
+                    if (threw) err = cap.GetType().Name + ": " + cap.Message;
+                    else if (timedOut) err = "TimeoutException: UI dispatcher did not run Connect within 10s";
+                    LogSafe("reconnect: " + nameArg + " attempted threw=" + threw + " timedOut=" + timedOut + ((threw || timedOut) ? " " + err : ""));
+                    if (ran) System.Threading.Thread.Sleep(1500);   // connect kicked off -> let the async connect begin
+                }
+
+                var live2 = new List<Connection>();
+                try { lock (Connection.Connections) { foreach (Connection c in Connection.Connections) live2.Add(c); } } catch { }
+                string statusAfter = LiveStatusOf(live2, nameArg);
+
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"ok\",\"ts\":" + JsonStr(DateTime.UtcNow.ToString("o")) +
+                       ",\"name\":" + JsonStr(nameArg) +
+                       ",\"wasConnected\":" + (wasConnected ? "true" : "false") +
+                       ",\"connectAttempted\":" + (attempted ? "true" : "false") +
+                       ",\"connectThrew\":" + (threw ? "true" : "false") +
+                       ",\"connectTimedOut\":" + (timedOut ? "true" : "false") +
+                       ",\"connectError\":" + JsonStr(err) +
+                       ",\"statusAfter\":" + JsonStr(statusAfter) + "}";
+            }
+            catch (Exception ex)
+            {
+                return "{\"id\":" + JsonStr(id) + ",\"status\":\"error\",\"errors\":[{" +
+                       "\"code\":\"BRIDGE\",\"message\":" + JsonStr(ex.GetType().Name + ": " + ex.Message) + "}]}";
+            }
+        }
+
+        // live ConnectionStatus for a configured connection name, or "(none)" if not active.
+        private static string LiveStatusOf(List<Connection> live, string name)
+        {
+            foreach (Connection c in live)
+                if (SafeStr(delegate { return c.Options != null ? c.Options.Name : ""; }) == name)
+                    return SafeStr(delegate { return c.Status.ToString(); });
+            return "(none)";
+        }
+
+        private static readonly System.Globalization.CultureInfo InvCi =
+            System.Globalization.CultureInfo.InvariantCulture;
+
+        // how many most-recent executions to include per account
+        private const int RecentExecutionsMax = 12;
+
+        private static bool IsWorkingState(string s)
+        {
+            return s == "Working" || s == "Accepted" || s == "Submitted" || s == "PartFilled"
+                || s == "TriggerPending" || s == "ChangeSubmitted" || s == "ChangePending"
+                || s == "CancelSubmitted";
+        }
+
+        private static string AcctNum(Account a, AccountItem item)
+        {
+            try { return Num(a.Get(item, Currency.UsDollar)); }
+            catch { return "null"; }
+        }
+
+        private static string PosUnrealized(Position p)
+        {
+            try { return Num(p.GetUnrealizedProfitLoss(PerformanceUnit.Currency, p.Instrument.MarketData.Last.Price)); }
+            catch { return "null"; }
+        }
+
+        private static string SafeStr(Func<string> f) { try { string s = f(); return s == null ? "" : s; } catch { return ""; } }
+        private static int SafeInt(Func<int> f) { try { return f(); } catch { return 0; } }
+        // like Num(...) on the getter, but a read FAILURE degrades to JSON null (not a misleading 0).
+        private static string SafeNum(Func<double> f) { try { return Num(f()); } catch { return "null"; } }
+
+        private static object GetProp(Type t, object o, string name)
+        {
+            PropertyInfo p = t.GetProperty(name);
+            return p != null ? p.GetValue(o, null) : null;
+        }
+
+        private static string AsStr(object o) { return o == null ? "" : o.ToString(); }
+
+        private void WriteResult(string name, string json)
+        {
+            try
+            {
+                string dst = Path.Combine(_resultDir, name);
+                string tmp = dst + ".tmp";
+                File.WriteAllText(tmp, json);
+                if (File.Exists(dst)) File.Delete(dst);
+                File.Move(tmp, dst);   // atomic rename so Python never reads a partial file
+            }
+            catch (Exception ex) { LogSafe("WriteResult: " + ex.Message); }
+        }
+
+        // ===== Output tee =====
+
+        // Every NT8 Print lands here, on whatever thread called Print — usually a strategy's
+        // calculation thread, every tick. Must stay allocation-light and NEVER touch disk or
+        // take a lock. Must also never throw: an exception escaping an OutputEvent subscriber
+        // would break Print() for the entire platform.
+        private void OnNtOutput(object sender, NinjaTrader.Code.OutputEventArgs e)
+        {
+            try
+            {
+                if (!_teeOn || e == null) return;
+                int tab = e.OutputTab == PrintTo.OutputTab2 ? 2 : 1;
+                if (Volatile.Read(ref _teeQueued) >= TeeQueueMax)
+                {
+                    // Bounded: drop, but COUNT it per tab so the drain can write a visible
+                    // {"dropped":N} record. A silent gap would read as "nothing was printed".
+                    if (tab == 2) Interlocked.Increment(ref _teeDropped2);
+                    else Interlocked.Increment(ref _teeDropped1);
+                    return;
+                }
+                _teeQueue.Enqueue(new TeeRec
+                {
+                    T = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture) + "Z",
+                    Tab = tab,
+                    Reset = e.IsReset,
+                    Msg = e.IsReset ? null : e.Message
+                });
+                Interlocked.Increment(ref _teeQueued);
+            }
+            catch { }
+        }
+
+        // Poller-thread half: pick up a marker flip, then flush. Guarded so two ticks can
+        // never write the same file concurrently (a slow disk makes that reachable).
+        private void TeeTick()
+        {
+            if (Interlocked.Exchange(ref _teeDraining, 1) == 1) return;
+            try
+            {
+                if (_teeMarker == null) return;
+                bool want = File.Exists(_teeMarker);
+                if (want != _teeOn)
+                {
+                    _teeOn = want;
+                    LogSafe("tee: Output 1/2 capture " + (want ? "ENABLED" : "disabled") + " (marker)");
+                }
+                DrainTee();
+            }
+            catch (Exception ex) { LogSafe("tee tick: " + ex.Message); }
+            finally { Interlocked.Exchange(ref _teeDraining, 0); }
+        }
+
+        // Drain once under the same guard, waiting briefly for an in-flight drain rather than
+        // racing it. Used by Terminated, which runs off the poller thread.
+        private void FlushTeeGuarded()
+        {
+            for (int i = 0; i < 20; i++)   // ~1s worth of 50ms waits, then give up rather than hang a reload
+            {
+                if (Interlocked.Exchange(ref _teeDraining, 1) == 0)
+                {
+                    try { DrainTee(); }
+                    catch (Exception ex) { LogSafe("tee flush: " + ex.Message); }
+                    finally { Interlocked.Exchange(ref _teeDraining, 0); }
+                    return;
+                }
+                Thread.Sleep(50);
+            }
+            LogSafe("tee flush: a drain was still in flight after 1s — skipped (queued records lost)");
+        }
+
+        // Drain the queue into per-tab JSONL. Single-threaded by construction, so the files
+        // need no cross-thread coordination and rotation is safe to do inline.
+        private void DrainTee()
+        {
+            if (_outDir == null) return;
+            var buf = new Dictionary<int, StringBuilder>();
+
+            // Drop markers first: they describe the gap that is about to precede these lines.
+            int d1 = Interlocked.Exchange(ref _teeDropped1, 0);
+            int d2 = Interlocked.Exchange(ref _teeDropped2, 0);
+            if (d1 > 0) TeeBuf(buf, 1).Append(TeeDropJson(1, d1));
+            if (d2 > 0) TeeBuf(buf, 2).Append(TeeDropJson(2, d2));
+
+            TeeRec rec;
+            int drained = 0;
+            while (drained < TeeQueueMax && _teeQueue.TryDequeue(out rec))
+            {
+                Interlocked.Decrement(ref _teeQueued);
+                drained++;
+                StringBuilder sb = TeeBuf(buf, rec.Tab);
+                sb.Append("{\"t\":").Append(JsonStr(rec.T)).Append(",\"tab\":").Append(rec.Tab);
+                if (rec.Reset) sb.Append(",\"reset\":true");
+                else sb.Append(",\"msg\":").Append(JsonStr(rec.Msg));
+                sb.Append("}\n");
+            }
+            if (buf.Count == 0) return;
+
+            Directory.CreateDirectory(_outDir);
+            foreach (KeyValuePair<int, StringBuilder> kv in buf)
+            {
+                string path = Path.Combine(_outDir, "tab" + kv.Key + ".jsonl");
+                try
+                {
+                    RotateTeeIfNeeded(path, kv.Value.Length);
+                    File.AppendAllText(path, kv.Value.ToString());
+                }
+                catch (Exception ex) { LogSafe("tee write tab" + kv.Key + ": " + ex.Message); }
+            }
+        }
+
+        private StringBuilder TeeBuf(Dictionary<int, StringBuilder> buf, int tab)
+        {
+            StringBuilder sb;
+            if (!buf.TryGetValue(tab, out sb)) { sb = new StringBuilder(); buf[tab] = sb; }
+            return sb;
+        }
+
+        private string TeeDropJson(int tab, int n)
+        {
+            return "{\"t\":" + JsonStr(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture) + "Z")
+                   + ",\"tab\":" + tab + ",\"dropped\":" + n + "}\n";
+        }
+
+        // One generation kept: tabN.jsonl -> tabN.1.jsonl. A chatty strategy must not fill
+        // the drive, and an unbounded log is one nobody reads anyway.
+        private void RotateTeeIfNeeded(string path, int incoming)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists || fi.Length + incoming <= TeeRotateBytes) return;
+                string prev = Path.ChangeExtension(path, null) + ".1.jsonl";
+                if (File.Exists(prev)) File.Delete(prev);
+                File.Move(path, prev);
+                LogSafe("tee: rotated " + Path.GetFileName(path) + " -> " + Path.GetFileName(prev));
+            }
+            catch (Exception ex) { LogSafe("tee rotate: " + ex.Message); }
+        }
+
+        private static string JsonStr(string s)
+        {
+            if (s == null) return "\"\"";
+            var sb = new StringBuilder("\"");
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.Append("\"").ToString();
+        }
+
+        private static string ExtractJsonString(string json, string key)
+        {
+            if (json == null) return null;
+            string pat = "\"" + key + "\"";
+            int i = json.IndexOf(pat, StringComparison.Ordinal);
+            if (i < 0) return null;
+            i = json.IndexOf(':', i + pat.Length);
+            if (i < 0) return null;
+            int q1 = json.IndexOf('"', i + 1);
+            if (q1 < 0) return null;
+            int q2 = json.IndexOf('"', q1 + 1);
+            if (q2 < 0) return null;
+            return json.Substring(q1 + 1, q2 - q1 - 1);
+        }
+
+        // Return the "{...}" object substring for  "key":{...}  via a balanced-brace scan from the
+        // first '{' after the key (string-aware so braces inside quoted values do not miscount).
+        // Returns "" when the key is absent or its value is not an object. Scoping a flat key read
+        // (e.g. "instrument") to the right nested slice prevents collisions with a same-named value
+        // elsewhere in the trigger. Dependency-free (no Newtonsoft).
+        private static string ExtractJsonObject(string json, string key)
+        {
+            if (json == null) return "";
+            string pat = "\"" + key + "\"";
+            int i = json.IndexOf(pat, StringComparison.Ordinal);
+            if (i < 0) return "";
+            int c = json.IndexOf(':', i + pat.Length);
+            if (c < 0) return "";
+            int open = c + 1;
+            while (open < json.Length && char.IsWhiteSpace(json[open])) open++;
+            if (open >= json.Length || json[open] != '{') return "";  // value is not an object
+            int depth = 0;
+            bool inStr = false;
+            for (int p = open; p < json.Length; p++)
+            {
+                char ch = json[p];
+                if (inStr)
+                {
+                    if (ch == '\\') { p++; continue; }   // skip the escaped char
+                    if (ch == '"') inStr = false;
+                }
+                else if (ch == '"') inStr = true;
+                else if (ch == '{') depth++;
+                else if (ch == '}')
+                {
+                    depth--;
+                    if (depth == 0) return json.Substring(open, p - open + 1);
+                }
+            }
+            return "";  // unbalanced
+        }
+
+        private void LogSafe(string msg)
+        {
+            try
+            {
+                string dir = _resultDir != null ? _resultDir : Path.GetTempPath();
+                File.AppendAllText(Path.Combine(dir, "bridge.log"),
+                    DateTime.UtcNow.ToString("o") + "  " + msg + Environment.NewLine);
+            }
+            catch { }
+        }
+    }
+}

@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "C:\MeDoc\Underdogs\GEX Study\convert_es_replay.py", line 44, in <module>
+    timestamps = batch.column(0).to_pylist()
+  File "pyarrow/array.pxi", line 1923, in pyarrow.lib.Array.to_pylist
+  File "pyarrow/array.pxi", line 2637, in pyarrow.lib.NumericArray._getitem_py
+    return Array._getitem_py(self, i)
+  File "pyarrow/array.pxi", line 1930, in pyarrow.lib.Array._getitem_py
+    return self.getitem(i).as_py()
+  File "pyarrow/scalar.pxi", line 838, in pyarrow.lib.TimestampScalar.as_py
+  File "pyarrow/scalar.pxi", line 719, in pyarrow.lib._datetime_from_int
+    raise ValueError(
+ValueError: Nanosecond resolution temporal type 1791816432092318800 is not safely convertible to microseconds to convert to datetime.datetime. Install pandas to return as Timestamp with nanosecond support or access the .value attribute.

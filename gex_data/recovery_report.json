@@ -1,0 +1,29 @@
+{
+  "period": [
+    "2025-11-12",
+    "2026-10-08"
+  ],
+  "stats": {
+    "commits_examined": 315,
+    "snapshots_parsed": 289,
+    "invalid": 26,
+    "source_timestamp_after_commit": 0,
+    "no_snapshot": 0
+  },
+  "counts": {
+    "ES": {
+      "same_day": 70,
+      "prior_day_candidate": 58
+    },
+    "NQ": {
+      "same_day": 67,
+      "prior_day_candidate": 59
+    }
+  },
+  "warnings": [
+    "Carry-forward is a candidate scenario, not verified next-session-effective GEX.",
+    "All wall prices require futures-basis validation.",
+    "Weekend and holiday dates in audit are not verified exchange trading sessions.",
+    "Historical commit timestamps establish availability, not the options snapshot calculation date."
+  ]
+}

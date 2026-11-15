@@ -1,0 +1,9 @@
+window,github_type,wall,overlap,median_absolute_difference_points,within_10_points,within_25_points,within_50_points
+same_day_expiry,same_day,put,21,118.98,0,2,5
+same_day_expiry,same_day,call,21,78.35,1,4,8
+same_day_expiry,prior_day_candidate,put,15,58.74,0,2,6
+same_day_expiry,prior_day_candidate,call,15,72.74,0,1,4
+within_45_days,same_day,put,21,89.59,2,3,5
+within_45_days,same_day,call,21,57.26,0,3,9
+within_45_days,prior_day_candidate,put,15,42.81,2,4,8
+within_45_days,prior_day_candidate,call,15,108.66,0,2,5
